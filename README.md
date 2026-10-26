@@ -22,7 +22,7 @@ This repository contains the implementation, experiments, and supporting resourc
 ZeroLeft was evaluated using open-access surgical images from [Surgical Tools](https://www.kaggle.com/datasets/jocelyndumlao/surgical-tools/data) and [HOSPI-Tools Dataset](https://zenodo.org/records/6796559?preview_file=Hospi_Tools_small_Mask_RCNN.zip). The framework processes open-surgery frames, applying zero-shot boundary isolation under complex conditions like specular reflections, blood, and motion blur.
 
 ## Roadmap & Future Work
-[ ] Zero-shot single-frame point-prompt segmentation via SAM 3.1.
+[In proccess] Zero-shot single-frame point-prompt segmentation via SAM 3.1.
 
 [ ] Multi-prompt bounding box isolation.
 
@@ -31,8 +31,9 @@ ZeroLeft was evaluated using open-access surgical images from [Surgical Tools](h
 [ ] Integration with WebXR/Augmented Reality viewports for heads-up surgical displays.
 
 ## License
-Distributed under the MIT License. See LICENSE for more information.
+Distributed under the MIT License. See [LICENSE](./LICENSE) for more information.
 
 ## Contact & Team
 Developed for the Meta Global AI Developer Hackathon 2026 (Indie Developer Track).
+
 Gustavo Adolfo Murillo | [LinkedIn](https://www.linkedin.com/in/murillolog/)
