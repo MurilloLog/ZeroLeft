@@ -7,37 +7,90 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Loading SAM in local just for OnClick() Gradio event
+try:
+    import torch
+    from segment_anything import sam_model_registry, SamPredictor
+    SAM_AVAILABLE = True
+except ImportError:
+    SAM_AVAILABLE = False
+
 class SAMClient:
-    def __init__(self):
-        self.api_key = os.getenv("META_API_KEY")
-        self.endpoint_url = os.getenv("META_SAM_ENDPOINT_URL")
+    def __init__(self, checkpoint_path="sam_vit_b_01ec64.pth", model_type="vit_b"):
+        self.device = "cuda" if self._has_cuda() else "cpu"
+        self.predictor = None
+        self.checkpoint_path = checkpoint_path
+        self.model_type = model_type
+        
+        if SAM_AVAILABLE and os.path.exists(checkpoint_path):
+            print(f"[INFO] Loading SAM {model_type} on {self.device} from {checkpoint_path}")
+            sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
+            sam.to(device=self.device)
+            self.predictor = SamPredictor(sam)
+        else:
+            if not SAM_AVAILABLE:
+                print("[WARN] Segment Anything Model is not installed. Run: pip install segment-anything torch")
+            else:
+                print(f"[WARN] Checkpoint was not found in {checkpoint_path}. Run: curl https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth")
+    
+    def _has_cuda(self):
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except:
+            return False
 
     def predict_mask(self, image: np.ndarray, click_coords: tuple) -> tuple:
-        # If there isn't any API Key, use simulation mode
-        if not self.api_key or not self.endpoint_url:
-            print("[INFO] Local Simulation Mode is Activated.")
+        """
+        process_click event from app.py
+        """
+        if image is None or click_coords is None:
+            return image, "Select an image and click an instrument"
+
+        x, y = click_coords
+        if self.predictor is None:
             return self._mock_segmentation(image, click_coords)
 
-        # Otherwise, try a real conexion
         try:
-            return self._call_meta_api(image, click_coords)
+            self.predictor.set_image(image)
+            input_point = np.array([[x, y]])
+            input_label = np.array([1])
+
+            masks, scores, logits = self.predictor.predict(
+                point_coords = input_point,
+                point_labels = input_label,
+                multimask_output = True
+            )
+
+            best_idx = np.argmax(scores)
+            best_mask = masks[best_idx]
+            best_score = scores[best_idx]
+            
+            # Make an overlay
+            overlay = image.copy()
+            # Green mask
+            colored_mask = np.zeros_like(image)
+            colored_mask[best_mask] = [0, 255, 128]
+            image_with_mask = cv2.addWeighted(colored_mask, 0.45, overlay, 0.55, 0)
+            
+            # Click pointer
+            cv2.circle(image_with_mask, (x, y), 6, (255, 0, 0), -1)
+            cv2.circle(image_with_mask, (x, y), 8, (255, 255, 255), 2)
+            
+            status = f"SAM {self.model_type} | Click ({x},{y}) | Score: {best_score:.2f} | Device: {self.device}"
+            return image_with_mask, status
+            
         except Exception as e:
-            print(f"[WARN] Error trying conecting with Meta Model API: {e}.")
+            print(f"[ERROR] SAM in local failed: {e}")
             return self._mock_segmentation(image, click_coords)
 
     def _mock_segmentation(self, image: np.ndarray, click_coords: tuple) -> tuple:
-        if click_coords is None:
-            return image, "Select a tool."
-
         x, y = click_coords
         overlay = image.copy()
-        
-        # Simulate a mask
         cv2.ellipse(overlay, (x, y), (60, 25), 30, 0, 360, (0, 255, 128), -1)
         image_with_mask = cv2.addWeighted(overlay, 0.45, image, 0.55, 0)
         cv2.circle(image_with_mask, (x, y), 5, (255, 0, 0), -1)
-
-        status_text = f"Tool detected on ({x}, {y}) [Simulation Mode]"
+        status_text = f"[MOCK] Tool detected on ({x}, {y}) - SAM is needed for real masking"
         return image_with_mask, status_text
 
     def _call_meta_api(self, image: np.ndarray, click_coords: tuple) -> tuple:
@@ -83,19 +136,14 @@ class SAMClient:
         overlay = image.copy()
         h, w, _ = image.shape
 
-        # Simulate 3 automatic detected masks over the frame
+        # Showing detected masks over the frame
         cv2.ellipse(overlay, (int(w*0.3), int(h*0.4)), (50, 20), 15, 0, 360, (0, 255, 128), -1)
         cv2.ellipse(overlay, (int(w*0.6), int(h*0.5)), (60, 22), -30, 0, 360, (255, 128, 0), -1)
-        cv2.rectangle(overlay, (int(w*0.4), int(h*0.7)), (int(w*0.55), int(h*0.82)), (0, 128, 255), -1)
-
-        processed_image = cv2.addWeighted(overlay, 0.45, image, 0.55, 0)
-        status_msg = "SAM 3.1 Auto-Segmentation: 3 Objects Identified Zero-Shot."
         
-        detected_objects = [
-            {"id": "TOOL-001", "class": "Hemostatic Forceps", "confidence": 0.96},
-            {"id": "TOOL-002", "class": "Surgical Scalpel", "confidence": 0.92},
-            {"id": "TOOL-003", "class": "Gauze Sponge", "confidence": 0.89}
-        ]
+        processed_image = cv2.addWeighted(overlay, 0.45, image, 0.55, 0)
+        status_msg = "OnClick-Segmentation"
+        
+        detected_objects = []
         
         return processed_image, status_msg, detected_objects
 

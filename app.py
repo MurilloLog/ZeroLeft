@@ -137,7 +137,8 @@ with gr.Blocks(title="ZeroLeft - Autonomous Surgical Audit") as demo:
                     "Stitch scissors",
                     "Gauze / Sponge",
                     "Retractor",
-                    "Syringe"
+                    "Syringe",
+                    "Globes"
                 ],
                 value="Episiotomy scissors",
                 label="Target Instrument Category (For Manual Clicks)"
