@@ -9,10 +9,11 @@ client = SAMClient(checkpoint_path="sam_vit_b_01ec64.pth", model_type="vit_b")
 # Global inventory data to keep track of detected instruments across the session
 inventory_data = []
 
-def process_click(image: np.ndarray, tool_type: str, evt: gr.SelectData):
+def process_click(image: np.ndarray, tool_type: str, point_mode: str, evt: gr.SelectData):
     """
     Callback for manual point selection on the surgical image.
-    Generates mask via SAM 3.1 API and appends single item to inventory.
+    Generates mask via SAM and appends single item to inventory.
+    point_mode: Add (green) or Remove shadow (red)
     """
     global inventory_data
     if image is None:
@@ -25,33 +26,71 @@ def process_click(image: np.ndarray, tool_type: str, evt: gr.SelectData):
     click_x = evt.index[0]
     click_y = evt.index[1]
     
-    # Single-point inference call
-    segmented_image, status = client.predict_mask(image, (click_x, click_y), tool_type)
+    # Determine label: 1 = add, 0 = remove shadow
+    label = 0 if "Remove" in point_mode else 1
     
-    # Log manual item into session memory
-    total_anns = len(client.annotations)
-    if total_anns > len(inventory_data):
-        #item_id = len(inventory_data) + 1 # New tool
+    # Single-point inference call with label support
+    segmented_image, status = client.predict_mask(image, (click_x, click_y), tool_type, point_label=label)
+    
+    # Rebuild inventory from annotations (source of truth)
+    inventory_data = []
+    for idx, ann in enumerate(client.annotations, 1):
+        fg = sum(np.array(ann['labels']) == 1)
+        bg = sum(np.array(ann['labels']) == 0)
         inventory_data.append({
-            "ID": f"ITEM-{total_anns:03d}",
-            "Instrument": tool_type,
-            "Coordinates (X, Y)": f"({click_x}, {click_y})",
-            "Mode": f"Click + {len(client.annotations[-1]['points'])} pts" if total_anns>0 else "Manual",
-            "Status": f"Score {client.annotations[-1]['score']:.2f}" if total_anns>0 else "Verified"
+            "ID": f"ITEM-{idx:03d}",
+            "Instrument": ann["class"],
+            "Coordinates (X, Y)": f"{len(ann['points'])} pts (fg={fg}, bg={bg})",
+            "Mode": f"Refined {len(ann['points'])} pts",
+            "Status": f"Score {ann['score']:.2f}"
         })
-    else:
-        # Update last register
-        if inventory_data:
-            inventory_data[-1]["Coordinates (X, Y)"] = f"{inventory_data[-1]['Coordinates (X, Y)']} + ({click_x},{click_y})"
-            inventory_data[-1]["Mode"] = f"Extended {len(client.annotations[-1]['points'])} pts"
     
     df_inventory = pd.DataFrame(inventory_data)
     return segmented_image, status, df_inventory
 
+def undo_last_point_fn(image: np.ndarray):
+    """
+    Remove last point from last instrument
+    """
+    global inventory_data
+    if image is None:
+        return None, "Please upload a surgical image first.", pd.DataFrame(inventory_data)
+    
+    composite, status = client.undo_last_point(image)
+    
+    # Rebuild inventory
+    inventory_data = []
+    for idx, ann in enumerate(client.annotations, 1):
+        fg = sum(np.array(ann['labels']) == 1)
+        bg = sum(np.array(ann['labels']) == 0)
+        inventory_data.append({
+            "ID": f"ITEM-{idx:03d}",
+            "Instrument": ann["class"],
+            "Coordinates (X, Y)": f"{len(ann['points'])} pts (fg={fg}, bg={bg})",
+            "Mode": f"Refined {len(ann['points'])} pts",
+            "Status": f"Score {ann['score']:.2f}"
+        })
+    
+    return composite, status, pd.DataFrame(inventory_data)
+
+def undo_last_obj_fn(image: np.ndarray):
+    """
+    Remove last full instrument
+    """
+    global inventory_data
+    if image is None:
+        return None, "Please upload a surgical image first.", pd.DataFrame(inventory_data)
+    
+    composite, status = client.undo_last(image)
+    
+    if inventory_data:
+        inventory_data = inventory_data[:-1]
+    
+    return composite, status, pd.DataFrame(inventory_data)
+
 def process_auto_scan(image: np.ndarray):
     """
-    Triggers zero-shot full-frame automatic mask generation across the entire image.
-    Detects all objects simultaneously without manual point inputs.
+    Triggers zero-shot full-frame automatic mask generation
     """
     global inventory_data
 
@@ -63,10 +102,8 @@ def process_auto_scan(image: np.ndarray):
             "Error: No image loaded."
         )
 
-    # Execute full-frame auto segmentation
     processed_image, status_msg, detected_objects = client.auto_segment_stage(image)
 
-    # Populate inventory dynamically with auto-detected tools
     inventory_data = []
     for idx, obj in enumerate(detected_objects, start=1):
         inventory_data.append({
@@ -112,7 +149,7 @@ def generate_audit_report():
     breakdown_str = "\n".join(breakdown_list)
     
     report = (
-        f"ZEROLEFT AUDIT REPORT ===\n"
+        f"ZEROLEFT AUDIT REPORT\n"
         f"Total Instruments Detected: {total_items}\n"
         f"Item Breakdown:\n{breakdown_str}\n\n"
         f"Spatial Safety Verification: PASSED\n"
@@ -141,21 +178,29 @@ with gr.Blocks(title="ZeroLeft - Autonomous Surgical Audit") as demo:
             tool_selector = gr.Radio(
                 choices=[
                     "Episiotomy scissors",
-                    "Hemostatic forceps",
+                    "Hemostatic Forceps",
                     "Scalpel",
                     "Stitch scissors",
                     "Gauze / Sponge",
                     "Retractor",
                     "Syringe",
-                    "Globes"
+                    "Gloves"
                 ],
                 value="Episiotomy scissors",
-                label="Class (Define color)"
+                label="Target Instrument Category (For Manual Clicks)"
+            )
+            point_mode = gr.Radio(
+                choices=["Add (green)", "Remove shadow (red)"],
+                value="Add (green)",
+                label="Point Mode - Add or Remove shadow"
             )
             with gr.Row():
                 btn_auto_scan = gr.Button("Auto-Scan Full Frame", variant="primary")
                 btn_audit = gr.Button("Generate Audit Log", variant="secondary")
                 btn_clear = gr.Button("Reset Session", variant="stop")
+            with gr.Row():
+                btn_undo_point = gr.Button("Undo last point", variant="secondary")
+                btn_undo_obj = gr.Button("Undo last instrument", variant="secondary")
 
         with gr.Column(scale=1):
             output_image = gr.Image(
@@ -169,23 +214,36 @@ with gr.Blocks(title="ZeroLeft - Autonomous Surgical Audit") as demo:
                 interactive=False
             )
             inventory_table = gr.Dataframe(
-                headers = ["ID", "Instrument", "Coordinates (X, Y)", "Mode", "Status"],
-                value = pd.DataFrame(columns=["ID", "Instrument", "Coordinates (X, Y)", "Mode", "Status"]),
-                label = "Tools",
-                interactive = False
+                headers=["ID", "Instrument", "Coordinates (X, Y)", "Mode", "Status"],
+                value=pd.DataFrame(
+                    columns=["ID", "Instrument", "Coordinates (X, Y)", "Mode", "Status"]
+                ),
+                label="Real-Time Operating Room Inventory",
+                interactive=False
             )
-            
 
     audit_output = gr.Textbox(
-        label = "Operational Audit Summary Report (Muse Spark Agentic Summary)",
-        lines = 7,
-        interactive = False
+        label="Operational Audit Summary Report (Muse Spark Agentic Summary)",
+        lines=7,
+        interactive=False
     )
 
-    # Event Handlers
+    # Event Handlers - defined after functions
     input_image.select(
         fn=process_click,
-        inputs=[input_image, tool_selector],
+        inputs=[input_image, tool_selector, point_mode],
+        outputs=[output_image, output_status, inventory_table]
+    )
+
+    btn_undo_point.click(
+        fn=undo_last_point_fn,
+        inputs=[input_image],
+        outputs=[output_image, output_status, inventory_table]
+    )
+
+    btn_undo_obj.click(
+        fn=undo_last_obj_fn,
+        inputs=[input_image],
         outputs=[output_image, output_status, inventory_table]
     )
 

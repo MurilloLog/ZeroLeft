@@ -24,7 +24,7 @@ CLASS_COLORS = {
     "Gauze / Sponge": (255, 255, 0),        # yellow
     "Retractor": (128, 0, 255),             # purple
     "Syringe": (0, 255, 255),               # cyan
-    "Globes": (128, 128, 128),              # gray
+    "Globes": (64, 64, 64),              # gray
 }
 
 class SAMClient:
@@ -66,7 +66,7 @@ class SAMClient:
         
         return not np.array_equal(image[::20, ::20], self.last_image[::20, ::20])
     
-    def predict_mask(self, image: np.ndarray, click_coords: tuple, tool_type: str = "Instrument") -> tuple:
+    def predict_mask(self, image: np.ndarray, click_coords: tuple, tool_type: str = "Instrument", point_label: int = 1) -> tuple:
         """
         process_click event from app.py
         """
@@ -86,23 +86,33 @@ class SAMClient:
             print("[INFO] New image") 
 
         should_refine = False
+        target_is_last = True
         if len(self.annotations) > 0:
             last = self.annotations[-1]
-            if last["class"] == tool_type:
+            if point_label == 0:
+                # If removing shadow, always refine last object regardless of distance
+                should_refine = True
+            elif last["class"] == tool_type:
                 cx, cy = last["centroid"]
                 dist = np.hypot(x - cx, y - cy)
                 if dist < 150:  # we are selecting the same tool, it is not a new one
                     should_refine = True
 
         if should_refine:
-            # Adding a new point to the previous tool
+            # Adding a new point to the previous tool (positive or negative)
             last = self.annotations[-1]
             last["points"].append([x, y])
-            last["labels"].append(1)
+            last["labels"].append(point_label)  # 1 = add, 0 = remove shadow
             points = np.array(last["points"])
             labels = np.array(last["labels"])
-            print(f"[INFO] Segmentation of {tool_type} improved with {len(points)} points")
+            fg = sum(np.array(last["labels"]) == 1)
+            bg = sum(np.array(last["labels"]) == 0)
+            print(f"[INFO] Segmentation of {tool_type} improved with {len(points)} points (fg={fg}, bg={bg})")
         else:
+            if point_label == 0:
+                # Cannot remove shadow without existing object
+                composite, status = self._render_composite(image)
+                return composite, "To remove shadow, first add a positive point on instrument, then use Remove mode"
             points = np.array([[x, y]])
             labels = np.array([1])
 
@@ -160,20 +170,26 @@ class SAMClient:
         # Blend
         composite = cv2.addWeighted(mask_layer, 0.45, overlay, 0.55, 0)
 
-        # Drawing labels and clicks
+        # Drawing labels and clicks - positive green, negative red X
         for idx, ann in enumerate(self.annotations):
             cx, cy = ann["centroid"]
             color = ann["color"]
             label = ann["class"]
-            # Visual border
+            # Visual border for label
             cv2.putText(composite, f"{label}", (cx+10, cy-10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 3, cv2.LINE_AA)
             cv2.putText(composite, f"{label}", (cx+10, cy-10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
-            # Central point (x,y)
-            cv2.circle(composite, (cx, cy), 4, color, -1)
-            cv2.circle(composite, (cx, cy), 6, (255,255,255), 1)
-            # Writing the tool ID
+            # Draw all points used
+            for pt, lb in zip(ann["points"], ann["labels"]):
+                px, py = int(pt[0]), int(pt[1])
+                if lb == 1:
+                    cv2.circle(composite, (px, py), 5, (0, 255, 0), -1)
+                    cv2.circle(composite, (px, py), 7, (255,255,255), 1)
+                else:
+                    cv2.circle(composite, (px, py), 5, (0, 0, 255), -1)
+                    cv2.line(composite, (px-4, py-4), (px+4, py+4), (255,255,255), 2)
+                    cv2.line(composite, (px+4, py-4), (px-4, py+4), (255,255,255), 2)
             cv2.putText(composite, f"#{idx+1}", (cx+10, cy+8), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1, cv2.LINE_AA)
 
@@ -221,6 +237,34 @@ class SAMClient:
         self.annotations = []
         self.last_image = None
 
+    def undo_last_point(self, image: np.ndarray) -> tuple:
+        """Remove last point from last annotation, for bad clicks"""
+        if len(self.annotations) == 0:
+            return image, "No objects to undo"
+        ann = self.annotations[-1]
+        if len(ann["points"]) <= 1:
+            return self.undo_last(image)
+        ann["points"].pop()
+        ann["labels"].pop()
+        points = np.array(ann["points"])
+        labels = np.array(ann["labels"])
+        masks, scores, _ = self.predictor.predict(point_coords=points, point_labels=labels, multimask_output=True)
+        best_idx = np.argmax(scores)
+        ann["mask"] = masks[best_idx]
+        ann["score"] = float(scores[best_idx])
+        ys, xs = np.where(ann["mask"])
+        ann["centroid"] = (int(xs.mean()), int(ys.mean())) if len(xs) > 0 else ann["centroid"]
+        composite, status = self._render_composite(image)
+        return composite, f"Point removed. {status}"
+
+    def undo_last(self, image: np.ndarray) -> tuple:
+        """Remove last full instrument"""
+        if len(self.annotations) > 0:
+            removed = self.annotations.pop()
+            print(f"[INFO] Removed {removed['class']}")
+        composite, status = self._render_composite(image) if len(self.annotations) > 0 else (image, "No objects")
+        return composite, f"Removed last. {status}"
+    
     def _call_meta_api(self, image: np.ndarray, click_coords: tuple) -> tuple:
         # Pending an HTTP call
         pass
