@@ -4,7 +4,7 @@ import pandas as pd
 from sam_client import SAMClient
 
 # Start the SAMClient instance
-client = SAMClient()
+client = SAMClient(checkpoint_path="sam_vit_b_01ec64.pth", model_type="vit_b")
 
 # Global inventory data to keep track of detected instruments across the session
 inventory_data = []
@@ -14,6 +14,7 @@ def process_click(image: np.ndarray, tool_type: str, evt: gr.SelectData):
     Callback for manual point selection on the surgical image.
     Generates mask via SAM 3.1 API and appends single item to inventory.
     """
+    global inventory_data
     if image is None:
         return (
             None,
@@ -25,17 +26,24 @@ def process_click(image: np.ndarray, tool_type: str, evt: gr.SelectData):
     click_y = evt.index[1]
     
     # Single-point inference call
-    segmented_image, status = client.predict_mask(image, (click_x, click_y))
+    segmented_image, status = client.predict_mask(image, (click_x, click_y), tool_type)
     
     # Log manual item into session memory
-    item_id = len(inventory_data) + 1
-    inventory_data.append({
-        "ID": f"ITEM-{item_id:03d}",
-        "Instrument": tool_type,
-        "Coordinates (X, Y)": f"({click_x}, {click_y})",
-        "Mode": "Manual Click",
-        "Status": "Verified"
-    })
+    total_anns = len(client.annotations)
+    if total_anns > len(inventory_data):
+        #item_id = len(inventory_data) + 1 # New tool
+        inventory_data.append({
+            "ID": f"ITEM-{total_anns:03d}",
+            "Instrument": tool_type,
+            "Coordinates (X, Y)": f"({click_x}, {click_y})",
+            "Mode": f"Click + {len(client.annotations[-1]['points'])} pts" if total_anns>0 else "Manual",
+            "Status": f"Score {client.annotations[-1]['score']:.2f}" if total_anns>0 else "Verified"
+        })
+    else:
+        # Update last register
+        if inventory_data:
+            inventory_data[-1]["Coordinates (X, Y)"] = f"{inventory_data[-1]['Coordinates (X, Y)']} + ({click_x},{click_y})"
+            inventory_data[-1]["Mode"] = f"Extended {len(client.annotations[-1]['points'])} pts"
     
     df_inventory = pd.DataFrame(inventory_data)
     return segmented_image, status, df_inventory
@@ -80,6 +88,7 @@ def reset_session():
     """
     global inventory_data
     inventory_data = []
+    client.clear()
     empty_df = pd.DataFrame(
         columns=["ID", "Instrument", "Coordinates (X, Y)", "Mode", "Status"]
     )
@@ -104,7 +113,7 @@ def generate_audit_report():
     
     report = (
         f"ZEROLEFT AUDIT REPORT ===\n"
-        f"Total Instruments Detected Zero-Shot: {total_items}\n"
+        f"Total Instruments Detected: {total_items}\n"
         f"Item Breakdown:\n{breakdown_str}\n\n"
         f"Spatial Safety Verification: PASSED\n"
         f"Protocol Status: Full-frame scan completed via Meta SAM 3.1.\n"
@@ -132,7 +141,7 @@ with gr.Blocks(title="ZeroLeft - Autonomous Surgical Audit") as demo:
             tool_selector = gr.Radio(
                 choices=[
                     "Episiotomy scissors",
-                    "Hemostatic Forceps",
+                    "Hemostatic forceps",
                     "Scalpel",
                     "Stitch scissors",
                     "Gauze / Sponge",
@@ -141,7 +150,7 @@ with gr.Blocks(title="ZeroLeft - Autonomous Surgical Audit") as demo:
                     "Globes"
                 ],
                 value="Episiotomy scissors",
-                label="Target Instrument Category (For Manual Clicks)"
+                label="Class (Define color)"
             )
             with gr.Row():
                 btn_auto_scan = gr.Button("Auto-Scan Full Frame", variant="primary")
@@ -160,18 +169,17 @@ with gr.Blocks(title="ZeroLeft - Autonomous Surgical Audit") as demo:
                 interactive=False
             )
             inventory_table = gr.Dataframe(
-                headers=["ID", "Instrument", "Coordinates (X, Y)", "Mode", "Status"],
-                value=pd.DataFrame(
-                    columns=["ID", "Instrument", "Coordinates (X, Y)", "Mode", "Status"]
-                ),
-                label="Real-Time Operating Room Inventory",
-                interactive=False
+                headers = ["ID", "Instrument", "Coordinates (X, Y)", "Mode", "Status"],
+                value = pd.DataFrame(columns=["ID", "Instrument", "Coordinates (X, Y)", "Mode", "Status"]),
+                label = "Tools",
+                interactive = False
             )
+            
 
     audit_output = gr.Textbox(
-        label="Operational Audit Summary Report (Muse Spark Agentic Summary)",
-        lines=7,
-        interactive=False
+        label = "Operational Audit Summary Report (Muse Spark Agentic Summary)",
+        lines = 7,
+        interactive = False
     )
 
     # Event Handlers
