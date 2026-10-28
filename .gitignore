@@ -6,3 +6,4 @@ venv/
 *.mp4
 *.zip
 *.pth
+exports/
