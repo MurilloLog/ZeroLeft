@@ -9,10 +9,15 @@ from sam_client import SAMClient
 # Two separate clients to keep before/after annotations independent
 client_before = SAMClient(checkpoint_path="sam_vit_b_01ec64.pth", model_type="vit_b")
 client_after = SAMClient(checkpoint_path="sam_vit_b_01ec64.pth", model_type="vit_b")
+# Client for text mode (uses same checkpoint but text method calls API)
+client_text = SAMClient(checkpoint_path="sam_vit_b_01ec64.pth", model_type="vit_b")
 
 # Global inventory data to keep track of detected instruments across the session
 inventory_before = []
 inventory_after = []
+
+# Cost control: set USE_REAL_API=false in .env to work 100% offline
+USE_REAL_API = os.getenv("USE_REAL_API", "false").lower() == "true"
 
 def _rebuild_inventory(client):
     """Helper: build inventory list from client.annotations"""
@@ -65,14 +70,48 @@ def undo_after_point(image):
     inventory_after = _rebuild_inventory(client_after)
     return composite, status, pd.DataFrame(inventory_after)
 
+def process_text_search(image, text_prompts_str, use_real_api_checkbox):
+    """
+    Phase 2: Text -> masks
+    text_prompts_str: comma separated e.g. "Scalpel, Hemostatic forceps"
+    """
+    if image is None:
+        return None, "Upload image first", pd.DataFrame([])
+    
+    # Parse prompts
+    prompts = [p.strip() for p in text_prompts_str.split(",") if p.strip()]
+    if not prompts:
+        return image, "Enter at least one prompt e.g. Scalpel", pd.DataFrame([])
+    
+    # Cost guard
+    if use_real_api_checkbox and not USE_REAL_API:
+        # If UI says real but env says false, warn
+        return image, "Set USE_REAL_API=true in .env to allow real calls. Currently using MOCK (no cost).", pd.DataFrame([])
+    
+    # Temporarily override env for this call
+    if not use_real_api_checkbox:
+        # Force mock
+        os.environ["META_API_KEY"] = ""
+        client_text.api_key = None
+    
+    composite, status, anns = client_text.predict_with_text(image, prompts)
+    
+    # Restore key if needed
+    if not use_real_api_checkbox:
+        client_text.api_key = os.getenv("META_API_KEY")
+    
+    inv = _rebuild_inventory(client_text)
+    return composite, status, pd.DataFrame(inv)
+
 def reset_all():
     global inventory_before, inventory_after
     inventory_before = []
     inventory_after = []
     client_before.clear()
     client_after.clear()
+    client_text.clear()
     empty = pd.DataFrame(columns=["ID", "Instrument", "Points", "Mode", "Status"])
-    return None, None, "Reset", empty, None, None, "Reset", empty, ""
+    return None, None, "Reset", empty, None, None, "Reset", empty, None, None, "Reset", empty, ""
 
 def export_audit():
     """Function 1: Export traceability artifact for jury"""
@@ -80,69 +119,51 @@ def export_audit():
         return "No instruments to export"
     os.makedirs("exports", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Save images with masks
-    # Note: composite images are returned by clients, we save last composites if available
-    # For simplicity, save inventories as JSON + visual report
     export_data = {
         "timestamp": timestamp,
         "before": inventory_before,
         "after": inventory_after,
-        "before_annotations": len(client_before.annotations),
-        "after_annotations": len(client_after.annotations)
+        "before_count": len(client_before.annotations),
+        "after_count": len(client_after.annotations),
+        "use_real_api": USE_REAL_API
     }
-    
     json_path = f"exports/inventory_{timestamp}.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(export_data, f, indent=2, ensure_ascii=False)
-    
-    return f"Exported to {json_path} | BEFORE: {len(inventory_before)} tools, AFTER: {len(inventory_after)} tools"
+    return f"Exported to {json_path} | BEFORE: {len(inventory_before)} AFTER: {len(inventory_after)}"
 
 def compare_before_after():
-    """Function 2: Traceability report - missing instruments detection"""
     if not inventory_before:
         return "Upload and segment BEFORE image first"
     if not inventory_after:
-        return "Upload and segment AFTER image. If all tools returned, AFTER should match BEFORE"
-    
+        return "Upload and segment AFTER image"
     from collections import Counter
     before_counts = Counter([x["Instrument"] for x in inventory_before])
     after_counts = Counter([x["Instrument"] for x in inventory_after])
-    
     all_types = set(before_counts.keys()) | set(after_counts.keys())
-    
-    report_lines = []
-    report_lines.append("ZEROLEFT TRACEABILITY REPORT")
-    report_lines.append(f"BEFORE: {len(inventory_before)} instruments")
+    lines = []
+    lines.append("ZEROLEFT TRACEABILITY REPORT")
+    lines.append(f"BEFORE: {len(inventory_before)}")
     for k,v in before_counts.items():
-        report_lines.append(f"  - {k}: {v}")
-    report_lines.append(f"\nAFTER: {len(inventory_after)} instruments")
+        lines.append(f"  - {k}: {v}")
+    lines.append(f"\nAFTER: {len(inventory_after)}")
     for k,v in after_counts.items():
-        report_lines.append(f"  - {k}: {v}")
-    
-    report_lines.append("\nDIFFERENCE (BEFORE - AFTER)")
+        lines.append(f"  - {k}: {v}")
+    lines.append("\nDIFFERENCE:")
     missing = False
     for tool in all_types:
         diff = before_counts.get(tool,0) - after_counts.get(tool,0)
         if diff > 0:
-            report_lines.append(f"   MISSING: {tool} x{diff} - Potential retained item!")
+            lines.append(f"  MISSING: {tool} x{diff}")
             missing = True
         elif diff < 0:
-            report_lines.append(f"  + EXTRA: {tool} x{-diff} (found extra)")
+            lines.append(f"  EXTRA: {tool} x{-diff}")
         else:
-            report_lines.append(f"   OK: {tool} count matches")
-    
-    if not missing:
-        report_lines.append("\n   VERIFICATION PASSED - No missing instruments")
-    else:
-        report_lines.append("\n   VERIFICATION FAILED - Check missing tools")
-    
-    # Explain classification
-    report_lines.append("\nNOTE ON CLASSIFICATION")
-    report_lines.append("Phase 1: Classification is HUMAN-LABELED via Radio. SAM only segments geometry.")
-    report_lines.append("Phase 2: Will use SAM 3.1 text prompts (e.g. 'Scalpel') for automatic recognition.")
-    
-    return "\n".join(report_lines)
+            lines.append(f"  OK: {tool}")
+    lines.append("\nVERIFICATION PASSED" if not missing else "\nVERIFICATION FAILED")
+    lines.append("\nMode 1: SAM segments geometry, YOU label via Radio")
+    lines.append("Mode 2: SAM 3.1 knows via text prompts + meta-sam-parser")
+    return "\n".join(lines)
 
 def process_click(image: np.ndarray, tool_type: str, point_mode: str, evt: gr.SelectData):
     """
@@ -294,64 +315,71 @@ def generate_audit_report():
     return report
 
 # Interface Layout Definition
-with gr.Blocks(title="ZeroLeft - Autonomous Surgical Audit") as demo:
-    gr.Markdown(
-        """
-        # ZeroLeft: An Intelligent Platform for Surgical Tool Traceability Based on Meta SAM 3
-        ### Meta Global AI Developer Hackathon 2026 | Indie Track
-        Run zero-shot **Auto-Scan** to segment all physical instruments in the operating field simultaneously, or click manually on specific tools to register individual items with **Meta SAM 3.1**.
+with gr.Blocks(title="ZeroLeft") as demo:
+    gr.Markdown(f"""
+    # ZeroLeft: Surgical Tool Traceability
+    ### Hackathon Meta 2026 - Indie Track
+    **Cost guard: USE_REAL_API={USE_REAL_API}** - Set false in .env to avoid charges. Mock mode is free.
+    - **Mode 1 (Clicks)**: SAM local vit_b, free, not API. Click + Add/Remove shadow + BEFORE/AFTER
+    - **Mode 2 (Text)**: SAM 3.1 via Meta Model API sam-3.1 + meta-sam-parser. Payment mode with $2.50/1000 imgs. Use checkbox.
+    """)
 
-        **Flow:**
-        1. Upload BEFORE image (setup tray) -> click each tool -> assign class (color)
-        2. Upload AFTER image (after surgery) -> repeat segmentation
-        3. Click Compare -> report missing tools
-        4. Export -> generates JSON for jury
-        """
-    )
-
-    with gr.Row():
-        tool_selector = gr.Radio(
-            choices=["Episiotomy scissors","Hemostatic Forceps","Scalpel","Stitch scissors","Gauze / Sponge","Retractor","Syringe","Globes"],
-            value="Scalpel", label="Instrument Class (defines color)"
-        )
-        point_mode = gr.Radio(
-            choices=["Add (green)", "Remove shadow (red)"],
-            value="Add (green)",
-            label="Point Mode"
-        )
-
+    with gr.Tab("Mode 1: BEFORE/AFTER Traceability (Free)"):
+        with gr.Row():
+            tool_selector = gr.Radio(
+                choices=["Episiotomy scissors","Hemostatic forceps","Scalpel","Stitch scissors","Gauze / Sponge","Retractor","Syringe","Gloves"],
+                value="Scalpel", label="Instrument Class (defines color)"
+            )
+            point_mode = gr.Radio(
+                choices=["Add (green)", "Remove shadow (red)"],
+                value="Add (green)",
+                label="Point Mode"
+            )
         with gr.Row():
             with gr.Column():
-                gr.Markdown("### BEFORE - Setup")
-                input_before = gr.Image(label="BEFORE Surgery - Input", type="numpy", interactive=True)
-                output_before = gr.Image(label="BEFORE - Masks + Labels", type="numpy", interactive=False)
+                gr.Markdown("### BEFORE")
+                input_before = gr.Image(label="BEFORE Input", type="numpy", interactive=True)
+                output_before = gr.Image(label="BEFORE Masks", type="numpy", interactive=False)
                 status_before = gr.Textbox(label="BEFORE Status", interactive=False)
                 table_before = gr.Dataframe(headers=["ID","Instrument","Points","Mode","Status"], label="BEFORE Inventory", interactive=False)
                 btn_undo_before = gr.Button("Undo last point BEFORE")
-            
             with gr.Column():
-                gr.Markdown("### AFTER - Post Surgery")
-                input_after = gr.Image(label="AFTER Surgery - Input", type="numpy", interactive=True)
-                output_after = gr.Image(label="AFTER - Masks + Labels", type="numpy", interactive=False)
+                gr.Markdown("### AFTER")
+                input_after = gr.Image(label="AFTER Input", type="numpy", interactive=True)
+                output_after = gr.Image(label="AFTER Masks", type="numpy", interactive=False)
                 status_after = gr.Textbox(label="AFTER Status", interactive=False)
                 table_after = gr.Dataframe(headers=["ID","Instrument","Points","Mode","Status"], label="AFTER Inventory", interactive=False)
                 btn_undo_after = gr.Button("Undo last point AFTER")
-
         with gr.Row():
-            btn_compare = gr.Button("Compare BEFORE vs AFTER - Generate Traceability Report", variant="primary")
-            btn_export = gr.Button("Export Inventory JSON for Jury", variant="secondary")
+            btn_compare = gr.Button("Compare BEFORE vs AFTER", variant="primary")
+            btn_export = gr.Button("Export JSON", variant="secondary")
             btn_clear = gr.Button("Reset All", variant="stop")
+        audit_output = gr.Textbox(label="Traceability Report", lines=12, interactive=False)
 
-        audit_output = gr.Textbox(label="Traceability Report + Classification Note", lines=15, interactive=False)
-
-        # Handlers
         input_before.select(fn=process_click_before, inputs=[input_before, tool_selector, point_mode], outputs=[output_before, status_before, table_before])
         input_after.select(fn=process_click_after, inputs=[input_after, tool_selector, point_mode], outputs=[output_after, status_after, table_after])
         btn_undo_before.click(fn=undo_before_point, inputs=[input_before], outputs=[output_before, status_before, table_before])
         btn_undo_after.click(fn=undo_after_point, inputs=[input_after], outputs=[output_after, status_after, table_after])
         btn_compare.click(fn=compare_before_after, inputs=[], outputs=[audit_output])
         btn_export.click(fn=export_audit, inputs=[], outputs=[audit_output])
-        btn_clear.click(fn=reset_all, inputs=[], outputs=[input_before, output_before, status_before, table_before, input_after, output_after, status_after, table_after, audit_output])
+        btn_clear.click(fn=reset_all, inputs=[], outputs=[input_before, output_before, status_before, table_before, input_after, output_after, status_after, table_after, audit_output, output_before, status_before, table_before, audit_output])
+
+    with gr.Tab("Mode 2: Text Prompt (SAM 3.1 API)"):
+        gr.Markdown("""
+        **How SAM knows Scalpel?** Phase 2: via Promptable Concept Segmentation. One concept per request (Meta spec).
+        Enter comma-separated but app will call API once per concept. Check logs for raw masks.
+        """)
+        with gr.Row():
+            with gr.Column():
+                input_text = gr.Image(label="Input Surgical Frame", type="numpy", interactive=True)
+                text_prompts = gr.Textbox(label="Text Prompts (comma separated)", value="Scalpel, Hemostatic forceps, Gauze / Sponge", placeholder="Scalpel, Retractor")
+                use_real_api = gr.Checkbox(label="Use REAL API (charges $2.50/1k) - Uncheck for MOCK free", value=False)
+                btn_text_search = gr.Button("Search by Text (SAM 3.1)", variant="primary")
+            with gr.Column():
+                output_text = gr.Image(label="Text Search Masks", type="numpy", interactive=False)
+                status_text = gr.Textbox(label="API Status + Raw Logs", lines=5, interactive=False)
+                table_text = gr.Dataframe(headers=["ID","Instrument","Points","Mode","Status"], label="Text Inventory", interactive=False)
+        btn_text_search.click(fn=process_text_search, inputs=[input_text, text_prompts, use_real_api], outputs=[output_text, status_text, table_text])
 
 if __name__ == "__main__":
     demo.launch(share=False)

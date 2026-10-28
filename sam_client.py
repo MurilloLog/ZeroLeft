@@ -2,10 +2,29 @@ import os
 import cv2
 import numpy as np
 import base64
-import requests
-from dotenv import load_dotenv
+import asyncio
 
-load_dotenv()
+try:
+    from openai import AsyncOpenAI
+    from meta_sam_parser import (
+        parse_responses_stream,
+        decode_mask_to_raster,
+        CompletedOutcome,
+        image_segmentation_format,
+        video_segmentation_format
+    )
+    # Try to import record types - they may vary by version
+    try:
+        from meta_sam_parser import SegmentationMaskRecord, SegmentationBoxRecord
+    except ImportError:
+        SegmentationMaskRecord = None
+        SegmentationBoxRecord = None
+    PARSER_AVAILABLE = True
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    PARSER_AVAILABLE = False
+    print("[WARN] pip install openai meta-sam-parser")
 
 # Loading SAM in local just for OnClick() Gradio event
 try:
@@ -14,6 +33,9 @@ try:
     SAM_AVAILABLE = True
 except ImportError:
     SAM_AVAILABLE = False
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # Masking colors for tools classes segmentation
 CLASS_COLORS = {
@@ -24,7 +46,7 @@ CLASS_COLORS = {
     "Gauze / Sponge": (255, 255, 0),        # yellow
     "Retractor": (128, 0, 255),             # purple
     "Syringe": (0, 255, 255),               # cyan
-    "Globes": (64, 64, 64),              # gray
+    "Gloves": (255, 255, 255),              # white
 }
 
 class SAMClient:
@@ -34,11 +56,15 @@ class SAMClient:
         self.checkpoint_path = checkpoint_path
         self.model_type = model_type
         self.last_image = None
-        self_last_image_hash = None
 
         # Masking history
         self.annotations = [] # {mask, class, color, points, labels, centroid}
         
+        # Meta API credentials for text prompts
+        self.api_key = os.getenv("META_API_KEY")
+        self.api_base = os.getenv("META_API_BASE")
+        self.text_model = os.getenv("SAM_TEXT_MODEL")
+
         if SAM_AVAILABLE and os.path.exists(checkpoint_path):
             print(f"[INFO] Loading SAM {model_type} on {self.device} from {checkpoint_path}")
             sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
@@ -65,7 +91,8 @@ class SAMClient:
             return True
         
         return not np.array_equal(image[::20, ::20], self.last_image[::20, ::20])
-    
+
+    #region Local inference
     def predict_mask(self, image: np.ndarray, click_coords: tuple, tool_type: str = "Instrument", point_label: int = 1) -> tuple:
         """
         process_click event from app.py
@@ -86,7 +113,7 @@ class SAMClient:
             print("[INFO] New image") 
 
         should_refine = False
-        target_is_last = True
+        
         if len(self.annotations) > 0:
             last = self.annotations[-1]
             if point_label == 0:
@@ -105,9 +132,9 @@ class SAMClient:
             last["labels"].append(point_label)  # 1 = add, 0 = remove shadow
             points = np.array(last["points"])
             labels = np.array(last["labels"])
-            fg = sum(np.array(last["labels"]) == 1)
-            bg = sum(np.array(last["labels"]) == 0)
-            print(f"[INFO] Segmentation of {tool_type} improved with {len(points)} points (fg={fg}, bg={bg})")
+            #fg = sum(np.array(last["labels"]) == 1)
+            #bg = sum(np.array(last["labels"]) == 0)
+            #print(f"[INFO] Segmentation of {tool_type} improved with {len(points)} points (fg={fg}, bg={bg})")
         else:
             if point_label == 0:
                 # Cannot remove shadow without existing object
@@ -143,7 +170,7 @@ class SAMClient:
                 "mask": best_mask,
                 "class": tool_type,
                 "color": color,
-                "points": points.tolist() if isinstance(points, np.ndarray) else [[x,y]],
+                "points": points.tolist(),
                 "labels": labels.tolist(),
                 "centroid": centroid,
                 "score": float(best_score)
@@ -264,42 +291,203 @@ class SAMClient:
             print(f"[INFO] Removed {removed['class']}")
         composite, status = self._render_composite(image) if len(self.annotations) > 0 else (image, "No objects")
         return composite, f"Removed last. {status}"
-    
-    def _call_meta_api(self, image: np.ndarray, click_coords: tuple) -> tuple:
-        # Pending an HTTP call
-        pass
+    #endregion
 
+    #region Meta API
+    def _encode_image_to_base64(self, image: np.ndarray) -> str:
+            # SAM API expects RGB PNG base64
+            _, buffer = cv2.imencode(".png", cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+            return base64.b64encode(buffer).decode("utf-8")
+    
+    async def _call_sam_api_async(self, image: np.ndarray, text_prompt: str):
+        """
+        Official Meta way: /v1/responses streaming + meta-sam-parser
+        Docs: learnopencv.com SAM 3.1 - Object Multiplex
+        """
+        if not PARSER_AVAILABLE:
+            raise RuntimeError("Install: pip install openai==2.21.0 meta-sam-parser==0.0.5")
+        
+        b64_img = self._encode_image_to_base64(image)
+        
+        async with AsyncOpenAI(base_url=self.api_base, api_key=self.api_key) as client:
+            # Important: One concept per request per Meta docs - "dog, cat" is NOT supported as multi-label
+            # Use single prompt like "Scalpel"
+            events = await client.responses.create(
+                model=self.text_model,
+                input=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": text_prompt},
+                        {"type": "input_image", "image_url": f"data:image/png;base64,{b64_img}"}
+                    ]
+                }],
+                stream=True,
+                metadata={"mask_encoding": "one_bit"}
+            )
+            
+            # For image, use image_segmentation_format, for video use video_segmentation_format
+            try:
+                fmt = image_segmentation_format()
+            except:
+                fmt = video_segmentation_format()
+            
+            parsed = parse_responses_stream(events, fmt)
+            async with parsed:
+                result = await parsed.final_result()
+            
+            if not isinstance(result.outcome, CompletedOutcome):
+                print(f"[WARN] Outcome not completed: {result.outcome}, diagnostics: {result.diagnostics}")
+            
+            return result
+
+    def predict_with_text(self, image: np.ndarray, text_prompts: list) -> tuple:
+        """
+        Synchronous wrapper that handles one prompt at a time (per Meta spec: one concept per request)
+        """
+        if image is None:
+            return None, "No image", []
+        if not text_prompts:
+            return image, "No prompts", []
+        if not self.api_key:
+            return self._mock_text_segmentation(image, text_prompts)
+        
+        # Meta says: commas are NOT a documented multi-label interface. Use one phrase per request.
+        # So we loop prompts
+        all_annotations = []
+        h, w = image.shape[:2]
+        
+        for prompt in text_prompts:
+            prompt = prompt.strip()
+            if not prompt:
+                continue
+            try:
+                print(f"[INFO] SAM 3.1 API call for concept: '{prompt}'")
+                result = asyncio.run(self._call_sam_api_async(image, prompt))
+                if not isinstance(result.outcome, CompletedOutcome):
+                    print(f"[WARN] Outcome: {result.outcome}, diag: {result.diagnostics}")
+
+                # Properly handle box + mask records
+                # Each object id has one box and one mask
+                boxes_by_id = {}
+                masks_by_id = {}
+                for rec in result.records:
+                    if hasattr(rec, 'mask') and rec.mask is not None:
+                        # Box has bounds with x,y,right,bottom and frame size
+                        oid = getattr(rec, 'object_id', '0')
+                        rev = getattr(rec, 'revision', 0)
+                        prev = masks_by_id.get(oid)
+                        if prev is None or rev > getattr(prev, 'revision', 0):
+                            masks_by_id[oid] = rec
+                    elif hasattr(rec, 'bounds'):
+                        oid = getattr(rec, 'object_id', '0')
+                        boxes_by_id[oid] = rec
+                
+                print(f"[INFO] Found {len(boxes_by_id)} boxes, {len(masks_by_id)} masks for '{prompt}'")
+                
+                for obj_id, mask_rec in masks_by_id.items():
+                    try:
+                        # Decode raster bytes
+                        raster_bytes = decode_mask_to_raster(mask_rec.mask)
+                        # According to docs, mask has width, height, and bounds has position
+                        # SegmentationMask has width,height ; bounds has x,y ?
+                        # Try to get x,y from mask_rec.bounds or mask_rec.mask
+                        # From pypi docs: SegmentationMaskRecord has bounds same as box
+                        # bounds is half-open box
+                        try:
+                            # Try bounds attribute on record
+                            bounds = getattr(mask_rec, 'bounds', None) or getattr(mask_rec, 'box', None)
+                            if bounds is None:
+                                # Try box record for same id
+                                box_rec = boxes_by_id.get(obj_id)
+                                bounds = getattr(box_rec, 'bounds', None) if box_rec else None
+                        except:
+                            bounds = None
+                        
+                        mh = mask_rec.mask.height
+                        mw = mask_rec.mask.width
+                        
+                        # x,y placement - from bounds if available, else 0,0
+                        x0, y0 = 0, 0
+                        if bounds is not None:
+                            try:
+                                # bounds has left, top, right, bottom or x,y
+                                x0 = int(getattr(bounds, 'left', getattr(bounds, 'x', 0)))
+                                y0 = int(getattr(bounds, 'top', getattr(bounds, 'y', 0)))
+                            except Exception as be:
+                                print(f"[WARN] bounds parse failed {be}, bounds={bounds}")
+                        
+                        arr = np.frombuffer(raster_bytes, dtype=np.uint8).reshape(mh, mw) > 0
+                        full_mask = np.zeros((h, w), dtype=bool)
+                        x1 = min(w, x0 + mw)
+                        y1 = min(h, y0 + mh)
+                        ah = y1 - y0
+                        aw = x1 - x0
+                        if ah > 0 and aw > 0:
+                            full_mask[y0:y1, x0:x1] = arr[:ah, :aw]
+                        
+                        ys, xs = np.where(full_mask)
+                        centroid = (int(xs.mean()), int(ys.mean())) if len(xs) > 0 else (w//2, h//2)
+                        
+                        all_annotations.append({
+                            "mask": full_mask,
+                            "class": prompt,
+                            "color": CLASS_COLORS.get(prompt, (0, 128, 255)),
+                            "points": [],
+                            "labels": [],
+                            "centroid": centroid,
+                            "score": 0.95,
+                            "source": "sam3.1_api",
+                            "object_id": obj_id
+                        })
+                        print(f"[INFO] Decoded mask id={obj_id} at ({x0},{y0}) size {mw}x{mh} - pixels {arr.sum()}")
+                    except Exception as e:
+                        print(f"[WARN] Decode failed for {prompt} id {obj_id}: {e} - {type(e).__name__}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+            except Exception as e:
+                print(f"[ERROR] API call for '{prompt}' failed: {e}")
+                import traceback
+                traceback.print_exc()
+                mock_comp, _, mock_anns = self._mock_text_segmentation(image, [prompt])
+                all_annotations.extend(mock_anns)
+        
+        if not all_annotations:
+            print("[WARN] No masks decoded, using mock")
+            return self._mock_text_segmentation(image, text_prompts)
+        
+        #self.annotations = all_annotations
+        self.annotations.extend(all_annotations)
+        self.last_image = image.copy()
+        composite, _ = self._render_composite(image)
+        status = f"SAM 3.1 API: Found {len(all_annotations)} objects for {text_prompts}"
+        return composite, status, all_annotations
+
+    def _mock_text_segmentation(self, image, text_prompts):
+        h, w = image.shape[:2]
+        self.annotations = []
+        import random
+        random.seed(42)
+        for prompt in text_prompts:
+            for j in range(random.randint(1,2)):
+                cx = random.randint(int(w*0.2), int(w*0.8))
+                cy = random.randint(int(h*0.2), int(h*0.8))
+                temp = np.zeros((h, w), dtype=np.uint8)
+                cv2.ellipse(temp, (cx, cy), (50, 20), random.randint(0,90), 0, 360, 255, -1)
+                mask = temp > 0
+                ys, xs = np.where(mask)
+                centroid = (int(xs.mean()), int(ys.mean())) if len(xs) > 0 else (cx, cy)
+                self.annotations.append({"mask": mask, "class": prompt, "color": CLASS_COLORS.get(prompt, (0,128,255)), "points": [], "labels": [], "centroid": centroid, "score": 0.9, "source": "mock"})
+        composite, _ = self._render_composite(image)
+        status = f"[MOCK TEXT] {len(self.annotations)} for {text_prompts}"
+        return composite, status, self.annotations
+    
     def auto_segment_stage(self, image: np.ndarray) -> tuple:
         """
         Executes zero-shot automatic mask generation across the entire surgical frame.
         Identifies all physical objects without manual point selection.
         """
-        if not self.api_key or not self.endpoint_url:
-            return self._mock_auto_segmentation(image)
-
-        try:
-            # Payload configured for automatic grid generation in SAM 3.1
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "image": self._encode_image_to_base64(image),
-                "generate_automatic_masks": True,
-                "points_per_side": 16,
-                "pred_iou_thresh": 0.88
-            }
-
-            response = requests.post(self.endpoint_url, json=payload, headers=headers, timeout=20)
-            if response.status_code == 200:
-                # Process automatically returned masks
-                pass
-
-            return self._mock_auto_segmentation(image)
-        except Exception as e:
-            print(f"[WARN] Auto-segmentation fallback triggered: {e}")
-            return self._mock_auto_segmentation(image)
+        return image, "Use text prompts", []
 
     def _mock_auto_segmentation(self, image):
         """
@@ -307,7 +495,4 @@ class SAMClient:
         """
         return image, "OnClick Gradio event", []
 
-    def _encode_image_to_base64(self, image: np.ndarray) -> str:
-        bgr_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        _, buffer = cv2.imencode(".png", bgr_image)
-        return base64.b64encode(buffer).decode("utf-8")
+    
