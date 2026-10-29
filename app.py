@@ -25,6 +25,11 @@ client_text = SAMClient(checkpoint_path="sam_vit_b_01ec64.pth", model_type="vit_
 inventory_before = []
 inventory_after = []
 
+last_phase3_before_counts = {}
+last_phase3_after_counts = {}
+last_phase3_prompts = []
+last_phase3_traceability = ""
+
 def _rebuild_inventory(client):
     """Helper: build inventory list from client.annotations"""
     inv = []
@@ -194,6 +199,12 @@ def process_phase3_auto(before_img, after_img, prompts_str, use_real):
     status_combined = f"PRE-OPERATION: {status_before} | POST-OPERATION: {status_after}"
     report = "\n".join(lines)
 
+    global last_phase3_before_counts, last_phase3_after_counts, last_phase3_prompts, last_phase3_traceability
+    last_phase3_before_counts = dict(before_counts)
+    last_phase3_after_counts = dict(after_counts)
+    last_phase3_prompts = prompts
+    last_phase3_traceability = report
+
     return composite_before, composite_after, status_combined, df_before, df_after, report
 
 def reset_manually():
@@ -230,6 +241,24 @@ def export_phase3(report):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     return f"Exported to {path}\n{report}"
+
+def generate_llama_clinical_report():
+    if not last_phase3_traceability:
+        return "Run Automatic comparison first"
+    before = last_phase3_before_counts
+    after = last_phase3_after_counts
+    prompts = last_phase3_prompts
+    trace = last_phase3_traceability
+    report, status = client_single_text.generate_llama_report(before, after, prompts, trace)
+    # Saving data
+    os.makedirs("exports", exist_ok=True)
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = f"exports/llama_clinical_{ts}.txt"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(report)
+    print(f"[LLAMA] Exported in {path}")
+    return f"{report}\n\n{status} - Exported in {path}"
 #endregion
 
 # Interface Layout Definition
@@ -312,12 +341,20 @@ with gr.Blocks(title="ZeroLeft") as demo:
         with gr.Row():
             btn_p3 = gr.Button("Run - Automatic comparison", variant="primary")
             btn_export_p3 = gr.Button("Export to JSON", variant="secondary")
-            btn_reset_all = gr.Button("Reset", variant="stop")
+            
+        btn_llama = gr.Button("Generate Llama Clinical Report)", variant="primary")
+        llama_report = gr.Textbox(label="Llama 4 Clinical Risk Report - WHO Checklist", lines=20, interactive=False)
+        
         stat_p3 = gr.Textbox(label="Status PRE-OPERATION | POST-OPERATION", interactive=False)
         rep_p3 = gr.Textbox(label="Automatic report - Traceability", lines=18, interactive=False)
 
+        btn_reset_all = gr.Button("Reset", variant="stop")
+        
         btn_p3.click(fn=process_phase3_auto, inputs=[in_p3_before, in_p3_after, txt_p3, chk_p3], outputs=[out_p3_before, out_p3_after, stat_p3, tbl_p3_before, tbl_p3_after, rep_p3])
         btn_export_p3.click(fn=export_phase3, inputs=[rep_p3], outputs=[rep_p3])
+        btn_p3.click(fn=process_phase3_auto, inputs=[in_p3_before, in_p3_after, txt_p3, chk_p3], outputs=[out_p3_before, out_p3_after, stat_p3, tbl_p3_before, tbl_p3_after, rep_p3])
+        btn_export_p3.click(fn=export_phase3, inputs=[rep_p3], outputs=[rep_p3])
+        btn_llama.click(fn=generate_llama_clinical_report, inputs=[], outputs=[llama_report])
         btn_reset_all.click(fn=reset_all, inputs=[], outputs=[in_before, out_before, stat_before, tbl_before, in_after, out_after, stat_after, tbl_after, rep1, in_single, out_single, stat_single, tbl_single, out_p3_before, out_p3_after, stat_p3, tbl_p3_before, tbl_p3_after, rep_p3])
 
 if __name__ == "__main__":

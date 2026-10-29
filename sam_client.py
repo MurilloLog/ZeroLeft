@@ -470,6 +470,70 @@ class SAMClient:
         status = f"SAM 3.1 API: Found {len(all_annotations)} objects for {text_prompts}"
         return composite, status, all_annotations
 
+    #region Llama report
+    async def _call_llama_async(self, system_prompt: str, user_prompt: str):
+        from openai import AsyncOpenAI
+        llama_model = os.getenv("LLAMA_MODEL", "muse-spark-1.3-contributor")
+        async with AsyncOpenAI(base_url=self.api_base, api_key=self.api_key) as client:
+            # Muse Spark/Wonder usan responses API igual que SAM, no chat.completions
+            resp = await client.responses.create(
+                model=llama_model,
+                input=[
+                    {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                    {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]}
+                ],
+            )
+            # Extraer texto de responses
+            text = ""
+            try:
+                text = resp.output_text
+            except:
+                try:
+                    text = resp.output[0].content[0].text
+                except:
+                    text = str(resp)
+            print(f"[LLAMA] Raw response length: {len(text)}")
+            return text
+
+    def generate_llama_report(self, before_counts: dict, after_counts: dict, prompts: list, traceability_text: str):
+        """Sync wrapper for Llama"""
+        if not self.api_key:
+            return "No API key - using mock", "[MOCK] Llama is working in local mode"
+
+        system_prompt = (
+            "You are a clinical surgical auditor with expertise in the WHO Safe Surgery protocol. "
+            "You analyze the traceability of surgical instruments detected by SAM 3.1. "
+            "Generate a concise clinical report in English, including the risk level and the possible location of the retained instrument, "
+            "and recommendations. Do not invent instruments that are not listed."
+        )
+        user_prompt = f"""
+        Input prompt: {prompts}
+        Pre-operation counts: {before_counts}
+        Post-operation counts: {after_counts}
+        SAM Technical Report:
+        {traceability_text}
+
+        Generate:
+        1. Executive summary (2 lines)
+        2. Risk analysis (high/medium/low) and justification
+        3. Missing instruments and possible location (intra-corporeal or in the field)
+        4. Recommended action according to the WHO checklist
+        5. Note: Limitations of SAM 3.1 in distinguishing between gauze and gloves due to similar colors
+        """
+
+        try:
+            print(f"[LLAMA] Calling to {os.getenv('LLAMA_MODEL','llama-4-maverick')}")
+            report = asyncio.run(self._call_llama_async(system_prompt, user_prompt))
+            if not report or len(report.strip()) < 10:
+                report = f"[WARN] Llama answer is empty, using a base report instead:\n{traceability_text}"
+            return report, f"Llama report created: {len(report)} chars"
+        except Exception as e:
+            print(f"[ERROR] Llama call failed: {e}")
+            import traceback
+            traceback.print_exc()
+            fallback = f"CLINICAL REPORT (fallback without Llama - error {e}):\n{traceability_text}\n\nRisk: Check manually the remaining instruments."
+            return fallback, f"Error using Llama API"
+        
     def _mock_text_segmentation(self, image, text_prompts):
         h, w = image.shape[:2]
         self.annotations = []
