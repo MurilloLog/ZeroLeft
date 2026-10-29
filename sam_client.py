@@ -203,9 +203,10 @@ class SAMClient:
             color = ann["color"]
             label = ann["class"]
             # Visual border for label
-            cv2.putText(composite, f"{label}", (cx+10, cy-10), 
+            offset_y = idx * 18
+            cv2.putText(composite, f"{label}", (cx+10, cy-10 - offset_y), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 3, cv2.LINE_AA)
-            cv2.putText(composite, f"{label}", (cx+10, cy-10), 
+            cv2.putText(composite, f"{label}", (cx+10, cy-10 - offset_y), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
             # Draw all points used
             for pt, lb in zip(ann["points"], ann["labels"]):
@@ -353,6 +354,7 @@ class SAMClient:
         
         # Meta says: commas are NOT a documented multi-label interface. Use one phrase per request.
         # So we loop prompts
+        self.annotations = []
         all_annotations = []
         h, w = image.shape[:2]
         
@@ -449,15 +451,20 @@ class SAMClient:
                 print(f"[ERROR] API call for '{prompt}' failed: {e}")
                 import traceback
                 traceback.print_exc()
-                mock_comp, _, mock_anns = self._mock_text_segmentation(image, [prompt])
-                all_annotations.extend(mock_anns)
+                #mock_comp, _, mock_anns = self._mock_text_segmentation(image, [prompt])
+                #all_annotations.extend(mock_anns)
+                print(f"[ERROR] API failed for '{prompt}', keeping empty")
+                continue
         
         if not all_annotations:
-            print("[WARN] No masks decoded, using mock")
-            return self._mock_text_segmentation(image, text_prompts)
+            print(f"[WARN] No masks for {text_prompts} decoded")
+            self.annotations = []
+            status = f"SAM 3.1 API: No objects found for {text_prompts} (0 masks)"
+            #return self._mock_text_segmentation(image, text_prompts)
+            return image, status, []
         
-        #self.annotations = all_annotations
-        self.annotations.extend(all_annotations)
+        self.annotations = all_annotations
+        #self.annotations.extend(all_annotations)
         self.last_image = image.copy()
         composite, _ = self._render_composite(image)
         status = f"SAM 3.1 API: Found {len(all_annotations)} objects for {text_prompts}"
