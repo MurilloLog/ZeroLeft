@@ -29,7 +29,7 @@ except ImportError:
 # Loading SAM in local just for OnClick() Gradio event
 try:
     import torch
-    from segment_anything import sam_model_registry, SamPredictor
+    from segment_anything import sam_model_registry, SamPredictor, SamAutomaticMaskGenerator
     SAM_AVAILABLE = True
 except ImportError:
     SAM_AVAILABLE = False
@@ -70,11 +70,22 @@ class SAMClient:
             sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
             sam.to(device=self.device)
             self.predictor = SamPredictor(sam)
+            self.mask_generator = SamAutomaticMaskGenerator(
+                model=sam,
+                points_per_side=16,
+                pred_iou_thresh=0.90,
+                stability_score_thresh=0.92,
+                crop_n_layers=0,
+                crop_n_points_downscale_factor=2,
+                min_mask_region_area=500.0
+            )
         else:
             if not SAM_AVAILABLE:
                 print("[WARN] Segment Anything Model is not installed. Run: pip install segment-anything torch")
+                self.mask_generator = None
             else:
                 print(f"[WARN] Checkpoint was not found in {checkpoint_path}. Run: curl https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth")
+                self.mask_generator = None
     
     def _has_cuda(self):
         try:
@@ -553,12 +564,46 @@ class SAMClient:
         status = f"[MOCK TEXT] {len(self.annotations)} for {text_prompts}"
         return composite, status, self.annotations
     
-    def auto_segment_stage(self, image: np.ndarray) -> tuple:
-        """
-        Executes zero-shot automatic mask generation across the entire surgical frame.
-        Identifies all physical objects without manual point selection.
-        """
-        return image, "Use text prompts", []
+    def auto_generate_all_masks(self, image: np.ndarray):
+        """Mode 4: SAM sugests all masks without prompts, then Muse Spark clasify them"""
+        if image is None:
+            return None, "No image", []
+        if not SAM_AVAILABLE or self.mask_generator is None:
+            print("[WARN] SamAutomaticMaskGenerator not available")
+            return image, "SAM auto not available", []
+        
+        print(f"[AUTO] Auto-masking the image {image.shape}")
+        self.annotations = []
+        masks_data = self.mask_generator.generate(image)
+        
+        all_annotations = []
+        for idx, m in enumerate(masks_data):
+            seg = m['segmentation']  # bool array HxW
+            bbox = m['bbox']  # x,y,w,h
+            x, y, w, h = bbox
+            cx, cy = int(x + w/2), int(y + h/2)
+            all_annotations.append({
+                "mask": seg,
+                "bbox": bbox,
+                "class": f"object-{idx}",
+                "color": (128, 128, 128),
+                "points": [],
+                "labels": [],
+                "centroid": (cx, cy),
+                "score": float(m.get('stability_score', 0.9)),
+                "source": "sam_auto",
+                "area": int(m.get('area', 0)),
+                "predicted_iou": float(m.get('predicted_iou', 0))
+            })
+        
+        self.annotations = all_annotations
+        self.last_image = image.copy()
+        composite, _ = self._render_composite(image)
+        print(f"[AUTO] Auto-masking {len(all_annotations)} created")
+        return composite, f"Auto: {len(all_annotations)} masks (SAM segmentation + Muse classify)", all_annotations
+
+    def auto_segment_stage(self, image: np.ndarray):
+        return self.auto_generate_all_masks(image)
 
     def _mock_auto_segmentation(self, image):
         """
