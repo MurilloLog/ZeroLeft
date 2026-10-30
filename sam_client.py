@@ -575,6 +575,26 @@ class SAMClient:
         print(f"[AUTO] Auto-masking the image {image.shape}")
         self.annotations = []
         masks_data = self.mask_generator.generate(image)
+        # Filtering masks over 70% of the imagen or <0.3% (noise)
+        H, W = image.shape[:2]
+        total_area = H*W
+        filtered = []
+        for m in masks_data:
+            area = m['area']
+            x, y, w, h = m['bbox']
+            # Filter 1: By area
+            if area > total_area*0.6:  # all image
+                continue
+            if area < total_area*0.003:  # dust <0.3%
+                continue
+            # Filter 2: By bbox
+            if w > W*0.85 or h > H*0.85:
+                    continue
+            # Filter 3: By border colission
+            if (x < 5 or y < 5) and (w > W*0.5 or h > H*0.5):
+                continue
+            filtered.append(m)
+        masks_data = filtered
         
         all_annotations = []
         for idx, m in enumerate(masks_data):
@@ -602,6 +622,96 @@ class SAMClient:
         print(f"[AUTO] Auto-masking {len(all_annotations)} created")
         return composite, f"Auto: {len(all_annotations)} masks (SAM segmentation + Muse classify)", all_annotations
 
+    def _encode_crop_to_base64(self, crop: np.ndarray):
+        _, buffer = cv2.imencode(".jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+        return base64.b64encode(buffer).decode("utf-8")
+
+    async def _classify_crop_muse_async(self, crop_b64: str, options: list):
+        from openai import AsyncOpenAI
+        model_id = os.getenv("LLAMA_MODEL")
+        system_prompt = (
+            "You are an expert in surgical instruments. Classify the image clip. "
+            f"Possible options: {', '.join(options)}. "
+            "Respond ONLY in JSON format: {\"instrument\": \"exact name\", \"confidence\": 0-100, \"reason\": \"brief\"}"
+        )
+        user_prompt = "Classify this surgical instrument. If it is not an instrument, explain. {\"instrument\": \"background\", \"confidence\": 0}"
+        
+        async with AsyncOpenAI(base_url=self.api_base, api_key=self.api_key) as client:
+            resp = await client.responses.create(
+                model=model_id,
+                input=[
+                    {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                    {"role": "user", "content": [
+                        {"type": "input_text", "text": user_prompt},
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{crop_b64}"}
+                    ]}
+                ],
+            )
+            try:
+                text = resp.output_text
+            except:
+                text = resp.output[0].content[0].text
+            return text
+
+    def classify_masks_with_muse(self, image: np.ndarray, options: list):
+        """Mode 4: Take the 7 auto-generated masks, trim each bbox, and classify them using Muse"""
+        if len(self.annotations) == 0:
+            return image, "First, run `auto_generate_all_masks`", []
+        
+        print(f"[MUSE-CLASSIFY] Sorting {len(self.annotations)} crops with {os.getenv('LLAMA_MODEL')}")
+        options = [
+            "Kelly hemostatic forceps curved 14cm with serrated jaws",
+            "Pean forceps straight 16cm", 
+            "Metzenbaum dissecting scissors curved",
+            "Mayo scissors straight",
+            "Adson tissue forceps with teeth",
+            "scalpel handle number 4 with blade",
+            "gauze sponge 2x3 and 5x5",
+            "latex glove",
+            "plastic syringe 10ml"
+        ]
+        classified = []
+        for idx, ann in enumerate(self.annotations):
+            x, y, w, h = ann["bbox"]
+            x, y = max(0, int(x)), max(0, int(y))
+            w, h = int(w), int(h)
+            # Recorte con padding 10px
+            x1, y1 = max(0, x-10), max(0, y-10)
+            x2, y2 = min(image.shape[1], x+w+10), min(image.shape[0], y+h+10)
+            crop = image[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            b64 = self._encode_crop_to_base64(crop)
+            try:
+                json_text = asyncio.run(self._classify_crop_muse_async(b64, options))
+                # Parse JSON
+                import json as js
+                # Reading JSON input from Spark
+                start = json_text.find("{")
+                end = json_text.rfind("}")+1
+                if start!=-1:
+                    data = js.loads(json_text[start:end])
+                    instrument = data.get("instrument", "unknown")
+                    conf = data.get("confidence", 0)
+                else:
+                    instrument = json_text.strip()[:30]
+                    conf = 50
+                
+                ann["class"] = instrument
+                ann["score"] = float(conf)/100.0
+                ann["color"] = CLASS_COLORS.get(instrument, CLASS_COLORS.get(instrument.split()[0], (0,255,128)))
+                print(f"[MUSE] Mask {idx} bbox {w}x{h} -> {instrument} {conf}%")
+                classified.append(ann)
+            except Exception as e:
+                print(f"[MUSE] Error classifying mask {idx}: {e}")
+                ann["class"] = "unknown"
+                classified.append(ann)
+
+        classified = [a for a in classified if "background" not in a["class"].lower() and a["score"] > 0.3]
+        self.annotations = classified
+        composite, _ = self._render_composite(image)
+        return composite, f"Muse classified {len(classified)} instruments", classified
+    
     def auto_segment_stage(self, image: np.ndarray):
         return self.auto_generate_all_masks(image)
 
