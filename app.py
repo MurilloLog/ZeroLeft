@@ -104,6 +104,69 @@ def compare_manual():
     return "\n".join(lines)
 #endregion
 
+
+# Mode 4: 2 images + text + exemplars
+def process_phase4_before_after(before_img, after_img, prompts_str, use_real):
+    global last_phase3_before_counts, last_phase3_after_counts, last_phase3_prompts, last_phase3_traceability
+    if before_img is None or after_img is None:
+        return None, None, "Upload your PRE and POST image", pd.DataFrame([]), pd.DataFrame([]), "No image uploaded", "No image uploaded"
+    prompts = [p.strip() for p in prompts_str.split(",") if p.strip()]
+    if not prompts:
+        return None, None, "Empty prompt", pd.DataFrame([]), pd.DataFrame([]), "", ""
+    folder = "exemplars_clean"
+    from pathlib import Path
+    if not os.path.exists(folder) or len(list(Path(folder).glob("*"))) == 0:
+        return None, None, f"No exemplars in {folder}", pd.DataFrame([]), pd.DataFrame([]), f"Make the {folder} folder with the clean images in 512x512 px", ""
+    api_backup_b = client_before_text.api_key
+    api_backup_a = client_after_text.api_key
+    if not use_real:
+        client_before_text.api_key = None
+        client_after_text.api_key = None
+    print(f"[MODE4] PRE/POST using exemplars {prompts}")
+    comp_b, _, _ = client_before_text.auto_generate_all_masks(before_img)
+    comp_b, status_b, _ = client_before_text.classify_masks_with_exemplars(before_img, folder, prompts)
+    inv_b = _rebuild_inventory(client_before_text)
+    comp_a, _, _ = client_after_text.auto_generate_all_masks(after_img)
+    comp_a, status_a, _ = client_after_text.classify_masks_with_exemplars(after_img, folder, prompts)
+    inv_a = _rebuild_inventory(client_after_text)
+    client_before_text.api_key = api_backup_b
+    client_after_text.api_key = api_backup_a
+    before_counts = Counter([x["Instrument"] for x in inv_b])
+    after_counts = Counter([x["Instrument"] for x in inv_a])
+    last_phase3_before_counts = dict(before_counts)
+    last_phase3_after_counts = dict(after_counts)
+    last_phase3_prompts = prompts
+    all_types = set(before_counts.keys()) | set(after_counts.keys())
+    lines = [f"ZEROLEFT TRACEABILITY", f"PRE: {len(inv_b)} {dict(before_counts)}", f"POST: {len(inv_a)} {dict(after_counts)}", "\nDIFERENCES:"]
+    missing=False
+    for t in all_types:
+        diff = before_counts.get(t,0) - after_counts.get(t,0)
+        if diff>0:
+            lines.append(f"  MISSING: {t} x{diff} - HIGH RISK")
+            missing=True
+        elif diff<0:
+            lines.append(f"  EXTRA: {t} x{-diff}")
+        else:
+            lines.append(f"  OK: {t}")
+    lines.append("\nFAILED" if missing else "\nPASSED")
+    report = "\n".join(lines)
+    last_phase3_traceability = report
+
+
+
+    log_lines = [f"MODE 4 -  {len(client_before_text.annotations)+len(client_after_text.annotations)} crops"]
+    for ann in client_before_text.annotations:
+        log_lines.append(f"PRE: {ann['class']} {ann['score']:.2f} bbox={ann['bbox']} matched_exemplar={ann.get('matched_exemplar','')}")
+    for ann in client_after_text.annotations:
+        log_lines.append(f"POST: {ann['class']} {ann['score']:.2f} bbox={ann['bbox']}")
+    log_text = "\n".join(log_lines)
+    return comp_b, comp_a, f"{status_b} | {status_a}", pd.DataFrame(inv_b), pd.DataFrame(inv_a), report, log_text
+    
+    
+    
+    #return comp_b, comp_a, f"{status_b} | {status_a}", pd.DataFrame(inv_b), pd.DataFrame(inv_a), report, report
+
+
 #region Mode 2: API calls
 def process_text_single(image, prompts_str, use_real):
     if image is None:
@@ -356,6 +419,35 @@ with gr.Blocks(title="ZeroLeft") as demo:
         btn_export_p3.click(fn=export_phase3, inputs=[rep_p3], outputs=[rep_p3])
         btn_llama.click(fn=generate_llama_clinical_report, inputs=[], outputs=[llama_report])
         btn_reset_all.click(fn=reset_all, inputs=[], outputs=[in_before, out_before, stat_before, tbl_before, in_after, out_after, stat_after, tbl_after, rep1, in_single, out_single, stat_single, tbl_single, out_p3_before, out_p3_after, stat_p3, tbl_p3_before, tbl_p3_after, rep_p3])
+
+
+    with gr.Tab("Mode 4: Before/After with Exemplars"):
+        gr.Markdown("""
+        **Workflow:**
+        1. Unprocessed images: blue metal tray with blood, jumbled instruments (actual OR)
+        2. Enter roll call text: Babcock, DeBakey, Metzenbaum...
+        3. SAM Auto suggests shapes (it doesn't know what they are)
+        4. Muse Spark 1.3 compares each dirty crop with your clean 512x512 white-background exemplars in the `exemplars_clean/` folder
+        5. Result: It distinguishes between Kelly and Pean even though SAM fails due to identical shapes
+        """)
+        with gr.Row():
+            with gr.Column():
+                in_p4_before = gr.Image(label="Mode 4: PRE-OP", type="numpy", interactive=True)
+                out_p4_before = gr.Image(label="Mode 4: PRE - Masks via exemplars", type="numpy", interactive=False)
+                tbl_p4_before = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], label="Mode 4: PRE count via exemplar")
+            with gr.Column():
+                in_p4_after = gr.Image(label="Mode 4: POST-OP", type="numpy", interactive=True)
+                out_p4_after = gr.Image(label="Mode 4: POST - Masks via exemplars", type="numpy", interactive=False)
+                tbl_p4_after = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], label="Mode 4: POST count via exemplar")
+        with gr.Row():
+            txt_p4 = gr.Textbox(label="Counting", value="Babcock, DeBakey, Metzenbaum, gauze, glove", placeholder="Babcock, DeBakey, Metzenbaum")
+            chk_p4 = gr.Checkbox(label="Use REAL API", value=False)
+        with gr.Row():
+            btn_p4 = gr.Button("Run", variant="primary")
+        stat_p4 = gr.Textbox(label="Status Mode 4", interactive=False)
+        rep_p4 = gr.Textbox(label="Traceability", lines=12, interactive=False)
+        llama_p4 = gr.Textbox(label="Clinical Report", lines=8, interactive=False)
+        btn_p4.click(fn=process_phase4_before_after, inputs=[in_p4_before, in_p4_after, txt_p4, chk_p4], outputs=[out_p4_before, out_p4_after, stat_p4, tbl_p4_before, tbl_p4_after, rep_p4, llama_p4])
 
 if __name__ == "__main__":
     demo.launch(share=False)

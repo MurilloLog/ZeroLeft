@@ -711,7 +711,85 @@ class SAMClient:
         self.annotations = classified
         composite, _ = self._render_composite(image)
         return composite, f"Muse classified {len(classified)} instruments", classified
-    
+
+
+    # Mode 4: Exemplars segmentation
+    async def _classify_crop_with_exemplars_async(self, crop_b64, exemplar_b64s, exemplar_labels, options):
+        from openai import AsyncOpenAI
+        model_id = os.getenv("LLAMA_MODEL")
+        exemplar_desc = "\n".join([f"- {lbl}: ref {i+1}" for i,lbl in enumerate(exemplar_labels)])
+        system_prompt = (
+            f"You're an expert in surgical instruments. You have {len(exemplar_labels)} exemplars in white background 512x512:\n{exemplar_desc}\n"
+            f"Options: {', '.join(options)}. "
+            "Compare the actual crop image (blue background, blood) with the exemplars. Return JSON ONLY: {\"instrument\": \"name\", \"confidence\": 0-100, \"matched_exemplar\": \"label\"}"
+        )
+        user_content = [{"type":"input_text","text":"Classify crop using exemplars:"}]
+        for eb64 in exemplar_b64s:
+            user_content.append({"type":"input_image","image_url": f"data:image/jpeg;base64,{eb64}"})
+        user_content.append({"type":"input_text","text":"Prueba bandeja sucia:"})
+        user_content.append({"type":"input_image","image_url": f"data:image/jpeg;base64,{crop_b64}"})
+        async with AsyncOpenAI(base_url=self.api_base, api_key=self.api_key) as client:
+            resp = await client.responses.create(
+                model=model_id,
+                input=[
+                    {"role":"system","content":[{"type":"input_text","text":system_prompt}]},
+                    {"role":"user","content": user_content}
+                ],
+            )
+            try:
+                return resp.output_text
+            except:
+                return resp.output[0].content[0].text
+
+    def classify_masks_with_exemplars(self, image, exemplar_folder="exemplars_clean", options=None):
+        from pathlib import Path
+        if len(self.annotations) == 0:
+            return image, "run auto_generate_all_masks", []
+        if options is None:
+            options = ["Babcock tissue forceps","DeBakey dissector","Metzenbaum scissors","forceps","Episiotomy scissors","Mayo needle holder","Stitch scissors","Syringe","gauze","glove"]
+        exemplar_paths = list(Path(exemplar_folder).glob("*.jpg")) + list(Path(exemplar_folder).glob("*.png"))
+        if not exemplar_paths:
+            print(f"[WARN] No exemplars en {exemplar_folder}, fallback")
+            return self.classify_masks_with_muse(image, options)
+        exemplar_b64s=[]; exemplar_labels=[]
+        for p in exemplar_paths[:4]:
+            img = cv2.imread(str(p))
+            if img is None: continue
+            exemplar_b64s.append(self._encode_crop_to_base64(img))
+            exemplar_labels.append(p.stem)
+        print(f"[MUSE-EXEMPLAR] {len(self.annotations)} crops con {len(exemplar_b64s)} exemplars")
+        classified=[]
+        for idx, ann in enumerate(self.annotations):
+            x,y,w,h = ann["bbox"]
+            x,y = max(0,int(x)), max(0,int(y)); w,h = int(w), int(h)
+            x1,y1 = max(0,x-10), max(0,y-10)
+            x2,y2 = min(image.shape[1], x+w+10), min(image.shape[0], y+h+10)
+            crop = image[y1:y2, x1:x2]
+            if crop.size==0: continue
+            b64 = self._encode_crop_to_base64(crop)
+            try:
+                import asyncio, json as js
+                json_text = asyncio.run(self._classify_crop_with_exemplars_async(b64, exemplar_b64s, exemplar_labels, options))
+                start = json_text.find("{"); end = json_text.rfind("}")+1
+                if start!=-1:
+                    data = js.loads(json_text[start:end])
+                    instrument = data.get("instrument","unknown")
+                    conf = data.get("confidence",0)
+                else:
+                    instrument = json_text.strip()[:40]; conf=50
+                    data = {}
+                ann["class"]=instrument; ann["score"]=float(conf)/100.0
+                ann["matched_exemplar"] = data.get("matched_exemplar","")
+                ann["reason"] = data.get("reason","")
+                if "background" not in instrument.lower() and conf>=30:
+                    classified.append(ann)
+            except Exception as e:
+                print(f"[EXEMPLAR] Error {idx}: {e}")
+                continue
+        self.annotations=classified
+        composite,_=self._render_composite(image)
+        return composite, f"Muse exemplar {len(classified)} using {len(exemplar_b64s)} refs", classified
+
     def auto_segment_stage(self, image: np.ndarray):
         return self.auto_generate_all_masks(image)
 
