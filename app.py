@@ -108,43 +108,75 @@ def compare_manual():
 # Mode 4: 2 images + text + exemplars
 def process_phase4_before_after(before_img, after_img, prompts_str, use_real):
     global last_phase3_before_counts, last_phase3_after_counts, last_phase3_prompts, last_phase3_traceability
+    from pathlib import Path
+    
     if before_img is None or after_img is None:
-        return None, None, "Upload your PRE and POST image", pd.DataFrame([]), pd.DataFrame([]), "No image uploaded", "No image uploaded"
+        empty = pd.DataFrame([])
+        return None, None, "Upload PRE and POST images", empty, empty, "Not image uploaded", "Not image uploaded"
+    
     prompts = [p.strip() for p in prompts_str.split(",") if p.strip()]
     if not prompts:
-        return None, None, "Empty prompt", pd.DataFrame([]), pd.DataFrame([]), "", ""
+        empty = pd.DataFrame([])
+        return None, None, "Empty prompt", empty, empty, "", ""
+    
     folder = "exemplars_clean"
-    from pathlib import Path
     if not os.path.exists(folder) or len(list(Path(folder).glob("*"))) == 0:
-        return None, None, f"No exemplars in {folder}", pd.DataFrame([]), pd.DataFrame([]), f"Make the {folder} folder with the clean images in 512x512 px", ""
+        empty = pd.DataFrame([])
+        return None, None, f"No exemplars in {folder}", empty, empty, f"Make {folder} with images in 512x512 px", ""
+
+    # Cost guard
     api_backup_b = client_before_text.api_key
     api_backup_a = client_after_text.api_key
     if not use_real:
         client_before_text.api_key = None
         client_after_text.api_key = None
-    print(f"[MODE4] PRE/POST using exemplars {prompts}")
-    comp_b, _, _ = client_before_text.auto_generate_all_masks(before_img)
-    comp_b, status_b, _ = client_before_text.classify_masks_with_exemplars(before_img, folder, prompts)
+
+    print(f" PRE/POST via exemplars {prompts} | use_real={use_real}")
+
+    # PRE - SAM + Muse via exemplars
+    if use_real:
+        comp_b, status_b_auto, _ = client_before_text.predict_with_text(before_img, prompts)
+    else:
+        comp_b, status_b_auto, _ = client_before_text.auto_generate_all_masks(before_img)
+    
+    comp_b, status_b_ex, _ = client_before_text.classify_masks_with_exemplars(before_img, folder, prompts)
     inv_b = _rebuild_inventory(client_before_text)
-    comp_a, _, _ = client_after_text.auto_generate_all_masks(after_img)
-    comp_a, status_a, _ = client_after_text.classify_masks_with_exemplars(after_img, folder, prompts)
+
+    # POST - SAM + Muse via exemplars
+    if use_real:
+        comp_a, status_a_auto, _ = client_after_text.predict_with_text(after_img, prompts)
+    else:
+        comp_a, status_a_auto, _ = client_after_text.auto_generate_all_masks(after_img)
+    
+    comp_a, status_a_ex, _ = client_after_text.classify_masks_with_exemplars(after_img, folder, prompts)
     inv_a = _rebuild_inventory(client_after_text)
+
+    # Restore keys
     client_before_text.api_key = api_backup_b
     client_after_text.api_key = api_backup_a
+
+    # Trazability
     before_counts = Counter([x["Instrument"] for x in inv_b])
     after_counts = Counter([x["Instrument"] for x in inv_a])
     last_phase3_before_counts = dict(before_counts)
     last_phase3_after_counts = dict(after_counts)
     last_phase3_prompts = prompts
+
+    # Report
     all_types = set(before_counts.keys()) | set(after_counts.keys())
-    lines = [f"ZEROLEFT TRACEABILITY", f"PRE: {len(inv_b)} {dict(before_counts)}", f"POST: {len(inv_a)} {dict(after_counts)}", "\nDIFERENCES:"]
-    missing=False
+    lines = [
+        f"ZEROLEFT TRACEABILITY",
+        f"PRE-OPERATION: {len(inv_b)} {dict(before_counts)}",
+        f"POST-OPERATION: {len(inv_a)} {dict(after_counts)}",
+        "\nDIFERENCES:"
+    ]
+    missing = False
     for t in all_types:
-        diff = before_counts.get(t,0) - after_counts.get(t,0)
-        if diff>0:
+        diff = before_counts.get(t, 0) - after_counts.get(t, 0)
+        if diff > 0:
             lines.append(f"  MISSING: {t} x{diff} - HIGH RISK")
-            missing=True
-        elif diff<0:
+            missing = True
+        elif diff < 0:
             lines.append(f"  EXTRA: {t} x{-diff}")
         else:
             lines.append(f"  OK: {t}")
@@ -152,21 +184,17 @@ def process_phase4_before_after(before_img, after_img, prompts_str, use_real):
     report = "\n".join(lines)
     last_phase3_traceability = report
 
-
-
-    log_lines = [f"MODE 4 -  {len(client_before_text.annotations)+len(client_after_text.annotations)} crops"]
+    # Detailed Log
+    log_lines = [f"MODE 4 - {len(list(Path(folder).glob('*')))} exemplars vs {len(inv_b)+len(inv_a)} crops"]
     for ann in client_before_text.annotations:
-        log_lines.append(f"PRE: {ann['class']} {ann['score']:.2f} bbox={ann['bbox']} matched_exemplar={ann.get('matched_exemplar','')}")
+        log_lines.append(f"PRE-OPERATION: {ann.get('class')} {ann.get('score',0):.2f} bbox={ann.get('bbox')} matched={ann.get('matched_exemplar','')} reason={ann.get('reason','')}")
     for ann in client_after_text.annotations:
-        log_lines.append(f"POST: {ann['class']} {ann['score']:.2f} bbox={ann['bbox']}")
+        log_lines.append(f"POST-OPERATION: {ann.get('class')} {ann.get('score',0):.2f} bbox={ann.get('bbox')} matched={ann.get('matched_exemplar','')} reason={ann.get('reason','')}")
     log_text = "\n".join(log_lines)
-    return comp_b, comp_a, f"{status_b} | {status_a}", pd.DataFrame(inv_b), pd.DataFrame(inv_a), report, log_text
-    
-    
-    
-    #return comp_b, comp_a, f"{status_b} | {status_a}", pd.DataFrame(inv_b), pd.DataFrame(inv_a), report, report
 
-
+    status_final = f"{status_b_auto} | {status_b_ex} || {status_a_auto} | {status_a_ex}"
+    return comp_b, comp_a, status_final, pd.DataFrame(inv_b), pd.DataFrame(inv_a), report, log_text
+    
 #region Mode 2: API calls
 def process_text_single(image, prompts_str, use_real):
     if image is None:
@@ -440,7 +468,7 @@ with gr.Blocks(title="ZeroLeft") as demo:
                 out_p4_after = gr.Image(label="Mode 4: POST - Masks via exemplars", type="numpy", interactive=False)
                 tbl_p4_after = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], label="Mode 4: POST count via exemplar")
         with gr.Row():
-            txt_p4 = gr.Textbox(label="Counting", value="Babcock, DeBakey, Metzenbaum, gauze, glove", placeholder="Babcock, DeBakey, Metzenbaum")
+            txt_p4 = gr.Textbox(label="Counting", value="forceps, scissors, gauze, glove", placeholder="Babcock, DeBakey, Metzenbaum")
             chk_p4 = gr.Checkbox(label="Use REAL API", value=False)
         with gr.Row():
             btn_p4 = gr.Button("Run", variant="primary")
