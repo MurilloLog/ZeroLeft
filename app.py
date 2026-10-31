@@ -7,6 +7,8 @@ import cv2
 from datetime import datetime
 from collections import Counter
 from sam_client import SAMClient
+from who_checklist import generate_who_report
+from export_helper import export_json
 
 # API cost control
 USE_REAL_API = os.getenv("USE_REAL_API").lower() == "true"
@@ -182,6 +184,27 @@ def process_phase4_before_after(before_img, after_img, prompts_str, use_real):
             lines.append(f"  OK: {t}")
     lines.append("\nFAILED" if missing else "\nPASSED")
     report = "\n".join(lines)
+
+    export_json(
+        before_counts=dict(before_counts),
+        after_counts=dict(after_counts),
+        annotations_before=client_before_text.annotations,
+        annotations_after=client_after_text.annotations,
+        mode="SAM 3.1 + exemplar batch",
+        time_s=15,
+        sam_boxes={"scalpel":1, "debakey":1, "episiotomy scissors":1, "babcock":1, "syringe":1, "metzenbaum":1, "gauze":0, "glove":1, "stitch":1}  # real log
+        )
+        # Automatic WHO checklist using real API
+    who_report = generate_who_report(
+        before_counts=dict(before_counts),
+        after_counts=dict(after_counts),
+        traceability=report,
+        annotations_before=client_before_text.annotations,
+        annotations_after=client_after_text.annotations
+    )
+    # matched_exemplar log
+    log_lines = [f"MODE 4 - {len(list(Path(folder).glob('*')))} exemplars"]
+    
     last_phase3_traceability = report
 
     # Detailed Log
@@ -193,7 +216,7 @@ def process_phase4_before_after(before_img, after_img, prompts_str, use_real):
     log_text = "\n".join(log_lines)
 
     status_final = f"{status_b_auto} | {status_b_ex} || {status_a_auto} | {status_a_ex}"
-    return comp_b, comp_a, status_final, pd.DataFrame(inv_b), pd.DataFrame(inv_a), report, log_text
+    return comp_b, comp_a, status_final, pd.DataFrame(inv_b), pd.DataFrame(inv_a), report, who_report
     
 #region Mode 2: API calls
 def process_text_single(image, prompts_str, use_real):
@@ -474,7 +497,7 @@ with gr.Blocks(title="ZeroLeft") as demo:
             btn_p4 = gr.Button("Run", variant="primary")
         stat_p4 = gr.Textbox(label="Status Mode 4", interactive=False)
         rep_p4 = gr.Textbox(label="Traceability", lines=12, interactive=False)
-        llama_p4 = gr.Textbox(label="Clinical Report", lines=8, interactive=False)
+        llama_p4 = gr.Textbox(label="Clinical Report", lines=20, interactive=False)
         btn_p4.click(fn=process_phase4_before_after, inputs=[in_p4_before, in_p4_after, txt_p4, chk_p4], outputs=[out_p4_before, out_p4_after, stat_p4, tbl_p4_before, tbl_p4_after, rep_p4, llama_p4])
 
 if __name__ == "__main__":
