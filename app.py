@@ -106,118 +106,6 @@ def compare_manual():
     return "\n".join(lines)
 #endregion
 
-
-# Mode 4: 2 images + text + exemplars
-def process_phase4_before_after(before_img, after_img, prompts_str, use_real):
-    global last_phase3_before_counts, last_phase3_after_counts, last_phase3_prompts, last_phase3_traceability
-    from pathlib import Path
-    
-    if before_img is None or after_img is None:
-        empty = pd.DataFrame([])
-        return None, None, "Upload PRE and POST images", empty, empty, "Not image uploaded", "Not image uploaded"
-    
-    prompts = [p.strip() for p in prompts_str.split(",") if p.strip()]
-    if not prompts:
-        empty = pd.DataFrame([])
-        return None, None, "Empty prompt", empty, empty, "", ""
-    
-    folder = "exemplars_clean"
-    if not os.path.exists(folder) or len(list(Path(folder).glob("*"))) == 0:
-        empty = pd.DataFrame([])
-        return None, None, f"No exemplars in {folder}", empty, empty, f"Make {folder} with images in 512x512 px", ""
-
-    # Cost guard
-    api_backup_b = client_before_text.api_key
-    api_backup_a = client_after_text.api_key
-    if not use_real:
-        client_before_text.api_key = None
-        client_after_text.api_key = None
-
-    print(f" PRE/POST via exemplars {prompts} | use_real={use_real}")
-
-    # PRE - SAM + Muse via exemplars
-    if use_real:
-        comp_b, status_b_auto, _ = client_before_text.predict_with_text(before_img, prompts)
-    else:
-        comp_b, status_b_auto, _ = client_before_text.auto_generate_all_masks(before_img)
-    
-    comp_b, status_b_ex, _ = client_before_text.classify_masks_with_exemplars(before_img, folder, prompts)
-    inv_b = _rebuild_inventory(client_before_text)
-
-    # POST - SAM + Muse via exemplars
-    if use_real:
-        comp_a, status_a_auto, _ = client_after_text.predict_with_text(after_img, prompts)
-    else:
-        comp_a, status_a_auto, _ = client_after_text.auto_generate_all_masks(after_img)
-    
-    comp_a, status_a_ex, _ = client_after_text.classify_masks_with_exemplars(after_img, folder, prompts)
-    inv_a = _rebuild_inventory(client_after_text)
-
-    # Restore keys
-    client_before_text.api_key = api_backup_b
-    client_after_text.api_key = api_backup_a
-
-    # Trazability
-    before_counts = Counter([x["Instrument"] for x in inv_b])
-    after_counts = Counter([x["Instrument"] for x in inv_a])
-    last_phase3_before_counts = dict(before_counts)
-    last_phase3_after_counts = dict(after_counts)
-    last_phase3_prompts = prompts
-
-    # Report
-    all_types = set(before_counts.keys()) | set(after_counts.keys())
-    lines = [
-        f"ZEROLEFT TRACEABILITY",
-        f"PRE-OPERATION: {len(inv_b)} {dict(before_counts)}",
-        f"POST-OPERATION: {len(inv_a)} {dict(after_counts)}",
-        "\nDIFERENCES:"
-    ]
-    missing = False
-    for t in all_types:
-        diff = before_counts.get(t, 0) - after_counts.get(t, 0)
-        if diff > 0:
-            lines.append(f"  MISSING: {t} x{diff} - HIGH RISK")
-            missing = True
-        elif diff < 0:
-            lines.append(f"  EXTRA: {t} x{-diff}")
-        else:
-            lines.append(f"  OK: {t}")
-    lines.append("\nFAILED" if missing else "\nPASSED")
-    report = "\n".join(lines)
-
-    export_json(
-        before_counts=dict(before_counts),
-        after_counts=dict(after_counts),
-        annotations_before=client_before_text.annotations,
-        annotations_after=client_after_text.annotations,
-        mode="SAM 3.1 + exemplar batch",
-        time_s=15,
-        sam_boxes={"scalpel":1, "debakey":1, "episiotomy scissors":1, "babcock":1, "syringe":1, "metzenbaum":1, "gauze":0, "glove":1, "stitch":1}  # real log
-        )
-        # Automatic WHO checklist using real API
-    who_report = generate_who_report(
-        before_counts=dict(before_counts),
-        after_counts=dict(after_counts),
-        traceability=report,
-        annotations_before=client_before_text.annotations,
-        annotations_after=client_after_text.annotations
-    )
-    # matched_exemplar log
-    log_lines = [f"MODE 4 - {len(list(Path(folder).glob('*')))} exemplars"]
-    
-    last_phase3_traceability = report
-
-    # Detailed Log
-    log_lines = [f"MODE 4 - {len(list(Path(folder).glob('*')))} exemplars vs {len(inv_b)+len(inv_a)} crops"]
-    for ann in client_before_text.annotations:
-        log_lines.append(f"PRE-OPERATION: {ann.get('class')} {ann.get('score',0):.2f} bbox={ann.get('bbox')} matched={ann.get('matched_exemplar','')} reason={ann.get('reason','')}")
-    for ann in client_after_text.annotations:
-        log_lines.append(f"POST-OPERATION: {ann.get('class')} {ann.get('score',0):.2f} bbox={ann.get('bbox')} matched={ann.get('matched_exemplar','')} reason={ann.get('reason','')}")
-    log_text = "\n".join(log_lines)
-
-    status_final = f"{status_b_auto} | {status_b_ex} || {status_a_auto} | {status_a_ex}"
-    return comp_b, comp_a, status_final, pd.DataFrame(inv_b), pd.DataFrame(inv_a), report, who_report
-    
 #region Mode 2: API calls
 def process_text_single(image, prompts_str, use_real):
     if image is None:
@@ -338,7 +226,9 @@ def reset_all():
         c.clear()
     empty = pd.DataFrame(columns=["ID","Instrument","Points","Score","Source"])
     return None, None, "Reset", empty, None, None, "Reset", empty, None, None, "Reset", empty, "", None, None, "", empty, empty, ""
+#endregion
 
+#region Mode 3: Text segmentation
 def export_phase3(report):
     os.makedirs("exports", exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -375,130 +265,311 @@ def generate_llama_clinical_report():
     return f"{report}\n\n{status} - Exported in {path}"
 #endregion
 
-# Interface Layout Definition
-with gr.Blocks(title="ZeroLeft") as demo:
-    gr.Markdown(f"""
-    # ZeroLeft: Surgical Tool Traceability
-    ### Meta Global AI Hackathon 2026 | Indie Track
+#region Mode 4: text + exemplars
+def process_phase4_before_after(before_img, after_img, prompts_str, use_real):
+    global last_phase3_before_counts, last_phase3_after_counts, last_phase3_prompts, last_phase3_traceability
+    from pathlib import Path
     
-    - **Mode 1 (Clicks)**: SAM local vit_b, free, not API. Click + Add/Remove shadow + BEFORE/AFTER operation
-    - **Mode 2 (Text)**: SAM 3.1 via Meta Model API sam-3.1 + meta-sam-parser. Payment mode with $2.50/1000 imgs. 
-    - **Mode 3 (Auto)**: PRE/POST instrumental image segmentation in automatic mode via Meta API sam-3.1. Payment mode with $2.50/1000 imgs.
+    if before_img is None or after_img is None:
+        empty = pd.DataFrame([])
+        return None, None, "Upload PRE and POST images", empty, empty, "Not image uploaded", "Not image uploaded"
     
-    Use its checkbox to activate them.
-    """)
+    prompts = [p.strip() for p in prompts_str.split(",") if p.strip()]
+    if not prompts:
+        empty = pd.DataFrame([])
+        return None, None, "Empty prompt", empty, empty, "", ""
+    
+    folder = "exemplars_clean"
+    if not os.path.exists(folder) or len(list(Path(folder).glob("*"))) == 0:
+        empty = pd.DataFrame([])
+        return None, None, f"No exemplars in {folder}", empty, empty, f"Make {folder} with images in 512x512 px", ""
 
-    with gr.Tab("Mode 1: Manual segmentation"):
-        with gr.Row():
-            tool_sel = gr.Radio(choices=["Episiotomy scissors","Hemostatic forceps","Scalpel","Stitch scissors","Gauze","Retractor","Syringe","Gloves"], value="Gloves", label="Instrument Class")
-            point_mode = gr.Radio(choices=["Add (green)", "Remove shadow (red)"], value="Add (green)", label="Click Mode")
-        with gr.Row():
-            with gr.Column():
-                gr.Markdown("### PRE-OPERATION IMAGE")
-                in_before = gr.Image(label="PRE-OPERATION - Full setup", type="numpy", interactive=True)
-                out_before = gr.Image(label="PRE-OPERATION - Mask output", type="numpy", interactive=False)
-                stat_before = gr.Textbox(label="PRE-OPERATION status", interactive=False)
-                tbl_before = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], label="PRE-OPERATION count", interactive=False)
-                btn_undo_b = gr.Button("Undo selection")
-            with gr.Column():
-                gr.Markdown("### POST-OPERATION IMAGE")
-                in_after = gr.Image(label="POST-OPERATION - Full setup", type="numpy", interactive=True)
-                out_after = gr.Image(label="POST-OPERATION - Mask output", type="numpy", interactive=False)
-                stat_after = gr.Textbox(label="POST-OPERATION status", interactive=False)
-                tbl_after = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], label="POST-OPERATION count", interactive=False)
-                btn_undo_a = gr.Button("Undo selection")
-        with gr.Row():
-            btn_comp1 = gr.Button("Manual comparison", variant="primary")
-            btn_clear = gr.Button("Reset", variant="stop")
-        rep1 = gr.Textbox(label="Manual report", lines=12)
+    # Cost guard
+    api_backup_b = client_before_text.api_key
+    api_backup_a = client_after_text.api_key
+    if not use_real:
+        client_before_text.api_key = None
+        client_after_text.api_key = None
 
-        in_before.select(fn=process_click_before, inputs=[in_before, tool_sel, point_mode], outputs=[out_before, stat_before, tbl_before])
-        in_after.select(fn=process_click_after, inputs=[in_after, tool_sel, point_mode], outputs=[out_after, stat_after, tbl_after])
-        btn_undo_b.click(fn=undo_before, inputs=[in_before], outputs=[out_before, stat_before, tbl_before])
-        btn_undo_a.click(fn=undo_after, inputs=[in_after], outputs=[out_after, stat_after, tbl_after])
-        btn_comp1.click(fn=compare_manual, inputs=[], outputs=[rep1])
-        btn_clear.click(fn=reset_manually, inputs=[], outputs=[in_before, out_before, stat_before, tbl_before, in_after, out_after, stat_after, tbl_after, rep1])
+    print(f" PRE/POST via exemplars {prompts} | use_real={use_real}")
 
-    with gr.Tab("Mode 2: Prompt segmentation"):
-        with gr.Row():
-            with gr.Column():
-                in_single = gr.Image(label="INPUT IMAGE", type="numpy", interactive=True)
-                txt_single = gr.Textbox(label="Prompts comma separated", value="glove, syringe, gauze", placeholder="scalpel, forceps, gauze")
-                chk_single = gr.Checkbox(label="Use REAL API ($2.50/1k images) - unchecked = MOCK free", value=False)
-                btn_single = gr.Button("Search by Text", variant="primary")
-            with gr.Column():
-                out_single = gr.Image(label="Masks Text", type="numpy", interactive=False)
-                stat_single = gr.Textbox(label="Status", lines=4)
-                tbl_single = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], label="Inventary Count")
-        btn_single.click(fn=process_text_single, inputs=[in_single, txt_single, chk_single], outputs=[out_single, stat_single, tbl_single])
+    # PRE - SAM + Muse via exemplars
+    if use_real:
+        comp_b, status_b_auto, _ = client_before_text.predict_with_text(before_img, prompts)
+    else:
+        comp_b, status_b_auto, _ = client_before_text.auto_generate_all_masks(before_img)
+    
+    comp_b, status_b_ex, _ = client_before_text.classify_masks_with_exemplars(before_img, folder, prompts)
+    inv_b = _rebuild_inventory(client_before_text)
 
-    with gr.Tab("Mode 3: Automatic PRE/POST operation comparison"):
+    # POST - SAM + Muse via exemplars
+    if use_real:
+        comp_a, status_a_auto, _ = client_after_text.predict_with_text(after_img, prompts)
+    else:
+        comp_a, status_a_auto, _ = client_after_text.auto_generate_all_masks(after_img)
+    
+    comp_a, status_a_ex, _ = client_after_text.classify_masks_with_exemplars(after_img, folder, prompts)
+    inv_a = _rebuild_inventory(client_after_text)
+
+    # Restore keys
+    client_before_text.api_key = api_backup_b
+    client_after_text.api_key = api_backup_a
+
+    # Trazability
+    before_counts = Counter([x["Instrument"] for x in inv_b])
+    after_counts = Counter([x["Instrument"] for x in inv_a])
+    last_phase3_before_counts = dict(before_counts)
+    last_phase3_after_counts = dict(after_counts)
+    last_phase3_prompts = prompts
+
+    # Report
+    all_types = set(before_counts.keys()) | set(after_counts.keys())
+    lines = [
+        f"ZEROLEFT TRACEABILITY",
+        f"PRE-OPERATION: {len(inv_b)} {dict(before_counts)}",
+        f"POST-OPERATION: {len(inv_a)} {dict(after_counts)}",
+        "\nDIFERENCES:"
+    ]
+    missing = False
+    for t in all_types:
+        diff = before_counts.get(t, 0) - after_counts.get(t, 0)
+        if diff > 0:
+            lines.append(f"  MISSING: {t} x{diff} - HIGH RISK")
+            missing = True
+        elif diff < 0:
+            lines.append(f"  EXTRA: {t} x{-diff}")
+        else:
+            lines.append(f"  OK: {t}")
+    lines.append("\nFAILED" if missing else "\nPASSED")
+    report = "\n".join(lines)
+
+    export_json(
+        before_counts=dict(before_counts),
+        after_counts=dict(after_counts),
+        annotations_before=client_before_text.annotations,
+        annotations_after=client_after_text.annotations,
+        mode="SAM 3.1 + exemplar batch",
+        time_s=15,
+        sam_boxes={"scalpel":1, "debakey":1, "episiotomy scissors":1, "babcock":1, "syringe":1, "metzenbaum":1, "gauze":0, "glove":1, "stitch":1}  # real log
+        )
+        # Automatic WHO checklist using real API
+    who_report = generate_who_report(
+        before_counts=dict(before_counts),
+        after_counts=dict(after_counts),
+        traceability=report,
+        annotations_before=client_before_text.annotations,
+        annotations_after=client_after_text.annotations
+    )
+    # matched_exemplar log
+    log_lines = [f"MODE 4 - {len(list(Path(folder).glob('*')))} exemplars"]
+    
+    last_phase3_traceability = report
+
+    # Detailed Log
+    log_lines = [f"MODE 4 - {len(list(Path(folder).glob('*')))} exemplars vs {len(inv_b)+len(inv_a)} crops"]
+    for ann in client_before_text.annotations:
+        log_lines.append(f"PRE-OPERATION: {ann.get('class')} {ann.get('score',0):.2f} bbox={ann.get('bbox')} matched={ann.get('matched_exemplar','')} reason={ann.get('reason','')}")
+    for ann in client_after_text.annotations:
+        log_lines.append(f"POST-OPERATION: {ann.get('class')} {ann.get('score',0):.2f} bbox={ann.get('bbox')} matched={ann.get('matched_exemplar','')} reason={ann.get('reason','')}")
+    log_text = "\n".join(log_lines)
+
+    status_final = f"{status_b_auto} | {status_b_ex} || {status_a_auto} | {status_a_ex}"
+    return comp_b, comp_a, status_final, pd.DataFrame(inv_b), pd.DataFrame(inv_a), report, who_report
+#endregion
+
+#region Interface Layout Definition
+theme = gr.themes.Soft(
+    primary_hue="teal",
+    secondary_hue="blue",
+    neutral_hue="slate",
+    radius_size="lg",
+    font=[gr.themes.GoogleFont("Inter"), "sans-serif"],
+).set(
+    body_background_fill="#f8fafc",
+    body_background_fill_dark="#0f172a",
+    block_background_fill="#ffffff",
+    block_background_fill_dark="#1e293b",
+    block_border_width="1px",
+    block_border_color="#e2e8f0",
+    block_border_color_dark="#334155",
+    block_radius="12px",
+    block_shadow="0 4px 12px rgba(0,0,0,0.05)",
+    button_primary_background_fill="linear-gradient(135deg, #0d9488 0%, #0891b2 100%)",
+    button_primary_background_fill_hover="linear-gradient(135deg, #0f766e 0%, #0e7490 100%)",
+    button_primary_text_color="white",
+    button_secondary_background_fill="#f1f5f9",
+    button_secondary_background_fill_dark="#334155",
+)
+
+custom_css = """
+/* Header */
+#header { background: linear-gradient(135deg, #269d95 10%, #269d95 50%, #269d95 100%); padding: 28px 32px; border-radius: 16px; color: white; margin-bottom: 20px; }
+#header h1 { color: white !important; font-size: 32px !important; font-weight: 800 !important; letter-spacing: -0.02em; }
+#header p { color: #ccfbf1 !important; opacity: 0.9; }
+.gradio-container { max-width: 1400px !important; }
+/* Cards */
+.card { background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+.card-dark { background: #1e293b; }
+/* Count Table*/
+.count-table { color: #0f172a !important; font-size: 16px; }
+/* Buttons */
+button { border-radius: 10px !important; font-weight: 600 !important; }
+#btn-run { background: linear-gradient(135deg, #0d9488, #0891b2) !important; color: white !important; }
+#btn-llama { background: linear-gradient(135deg, #1B365D, #005A9C) !important; color: white !important; }
+/* Images */
+.image-container { border-radius: 12px; overflow: hidden; border: 1px solid #e2e8f0; }
+.status-box { background: #f0fdfa !important; border: 1px solid #99f6e0 !important; border-radius: 8px; }
+.trace-box { background: #D5E8E6 !important; border: 1px solid #fde68a !important; }
+.who-box { background: #f5f3ff !important; border: 1px solid #c4b5fd !important; }
+.gr-dataframe, .gr-dataframe table, .gr-dataframe th, .gr-dataframe td, .gr-dataframe div {
+    color: #0f172a !important;
+    background-color: #ffffff !important;
+}
+.gr-dataframe th {
+    background-color: #f1f5f9 !important;
+    color: #0f172a !important;
+    font-weight: 700 !important;
+}
+
+#tbl_before .label-wrap span {
+    color: #0f172a !important;
+}
+/* Headers: ID, Instrument, Points, Score, Source in white color */
+#tbl_before thead th {
+    color: white !important;
+    background-color: #334155 !important;
+}
+/* Table background */
+#tbl_before tbody td {
+    color: #0f172a !important;
+    background-color: white !important;
+}
+"""
+
+with gr.Blocks(title="ZeroLeft - Surgical Audit", theme=theme, css=custom_css) as demo:
+    with gr.Column(elem_id="header"):
         gr.Markdown("""
-        **Workflow:**
-        1. Upload your pre-operation (tray containing all the instruments before use) and post-operation image (tray containing all the instruments after use)
-        2. Write short prompts—one word, lowercase, singular: `glove, gauze, syringe, scalpel`
-        3. Click `Run` to analyze and compare every image
-        4. Get the final report
+        # ZeroLeft: Surgical Tool Traceability
+        ### Meta Global AI Hackathon 2026 | Indie Track (Solo) | **Push the Frontier**
+        **Workflow:** PRE/POST tray audit • SAM 3.1 text + Auto masks • Muse Spark + Exemplars • WHO Checklist
         """)
         with gr.Row():
-            with gr.Column():
-                in_p3_before = gr.Image(label="PRE-OPERATION - Full setup", type="numpy", interactive=True)
-                out_p3_before = gr.Image(label="PRE-OPERATION - Masks auto", type="numpy", interactive=False)
-                tbl_p3_before = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], label="PRE-OPERATION count auto")
-            with gr.Column():
-                in_p3_after = gr.Image(label="POST-OPERATION - Post intervention", type="numpy", interactive=True)
-                out_p3_after = gr.Image(label="POST-OPERATION - Masks auto", type="numpy", interactive=False)
-                tbl_p3_after = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], label="POST-OPERATION count auto")
-        with gr.Row():
-            txt_p3 = gr.Textbox(label="Input prompts to segment", value="glove, gauze, syringe, scalpel", placeholder="glove, gauze, syringe")
-            chk_p3 = gr.Checkbox(label="Use REAL API - unchecked = MOCK", value=False)
-        with gr.Row():
-            btn_p3 = gr.Button("Run - Automatic comparison", variant="primary")
-            btn_export_p3 = gr.Button("Export to JSON", variant="secondary")
+            gr.Markdown("**Mode 1** Clicks local vit_b (free) • **Mode 2** Text SAM 3.1 API • **Mode 3** Auto PRE/POST + Spark • **Mode 4** Before/After Exemplars (limited Meta)")
+
+    with gr.Tabs():
+        with gr.Tab("Mode 1: Manual segmentation"):
+            with gr.Row():
+                tool_sel = gr.Radio(choices=["Episiotomy scissors","Hemostatic forceps","Scalpel","Stitch scissors","Gauze","Retractor","Syringe","Gloves"], value="Gloves", label="Instrument Class", elem_classes="card")
+                point_mode = gr.Radio(choices=["Add (green)", "Remove shadow (red)"], value="Add (green)", label="Click Mode", elem_classes="card")
+            with gr.Row():
+                with gr.Column(elem_classes="card"):
+                    gr.Markdown("<h3 style='color:#0f172a;text-align:center;'>PRE-OPERATION Full Setup Image</h3>")
+                    in_before = gr.Image(label="PRE-OPERATION - Full setup", type="numpy", height=380)
+                    out_before = gr.Image(label="PRE-OPERATION - Mask output", type="numpy", height=380)
+                    stat_before = gr.Textbox(label="Status", elem_classes="status-box")
+                    gr.Markdown("<h4 style='color:#0f172a;text-align:center;'>PRE-OPERATION count</h4>")
+                    tbl_before = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], elem_id="tbl_before")
+                    btn_undo_b = gr.Button("Undo selection", size="sm")
+                with gr.Column(elem_classes="card"):
+                    gr.Markdown("<h3 style='color:#0f172a;text-align:center;'>POST-OPERATION Full Setup Image</h3>")
+                    in_after = gr.Image(label="POST-OPERATION - Full setup", type="numpy", height=380)
+                    out_after = gr.Image(label="POST-OPERATION - Mask output", type="numpy", height=380)
+                    stat_after = gr.Textbox(label="Status", elem_classes="status-box")
+                    gr.Markdown("<h4 style='color:#0f172a;text-align:center;'>POST-OPERATION count</h4>")
+                    tbl_after = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], elem_id="tbl_before")
+                    btn_undo_a = gr.Button("Undo selection", size="sm")
+            with gr.Row():
+                btn_comp1 = gr.Button("Manual comparison", variant="primary", elem_id="btn-run")
+                btn_clear = gr.Button("Reset", variant="stop")
+            rep1 = gr.Textbox(label="Manual Traceability Report", lines=10, elem_classes="trace-box")
+
+            in_before.select(fn=process_click_before, inputs=[in_before, tool_sel, point_mode], outputs=[out_before, stat_before, tbl_before])
+            in_after.select(fn=process_click_after, inputs=[in_after, tool_sel, point_mode], outputs=[out_after, stat_after, tbl_after])
+            btn_undo_b.click(fn=undo_before, inputs=[in_before], outputs=[out_before, stat_before, tbl_before])
+            btn_undo_a.click(fn=undo_after, inputs=[in_after], outputs=[out_after, stat_after, tbl_after])
+            btn_comp1.click(fn=compare_manual, inputs=[], outputs=[rep1])
+            btn_clear.click(fn=reset_manually, inputs=[], outputs=[in_before, out_before, stat_before, tbl_before, in_after, out_after, stat_after, tbl_after, rep1])
+
+        with gr.Tab("Mode 2: Prompt Segmentation"):
+            gr.Markdown("**Workflow:** Write your prompts in singular lowercase: `glove, gauze, syringe`")
+            with gr.Row():
+                with gr.Column(elem_classes="card"):
+                    in_single = gr.Image(label="Input Image", type="numpy", height=420)
+                    txt_single = gr.Textbox(label="Prompts comma separated", value="glove, syringe, gauze", placeholder="scalpel, forceps, gauze")
+                    chk_single = gr.Checkbox(label="Use REAL API ($2.50/1k images) - unchecked = MOCK", value=False)
+                    btn_single = gr.Button("Search by Text", variant="primary", elem_id="btn-run")
+                with gr.Column(elem_classes="card"):
+                    out_single = gr.Image(label="Masks Text", type="numpy", height=420)
+                    stat_single = gr.Textbox(label="Status", elem_classes="status-box")
+                    gr.Markdown("<h4 style='color:#0f172a;text-align:center;'>Inventary Count</h4>")
+                    tbl_single = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], elem_id="tbl_before")
+            btn_single.click(fn=process_text_single, inputs=[in_single, txt_single, chk_single], outputs=[out_single, stat_single, tbl_single])
+
+        with gr.Tab("Mode 3: Automatic PRE/POST operation comparison"):
+            gr.Markdown("**Workflow:** 1. Upload PRE/POST trays 2. Prompts generic `forceps, scissors, gauze, glove` 3. Run → Trace + WHO report")
+            with gr.Row():
+                with gr.Column(elem_classes="card"):
+                    gr.Markdown("<h3 style='color:#0f172a;text-align:center;'>PRE-OPERATION</h3>")
+                    in_p3_before = gr.Image(label="PRE-OPERATION - Full setup", type="numpy", height=360)
+                    out_p3_before = gr.Image(label="PRE-OPERATION - Masks auto", type="numpy", height=360)
+                    gr.Markdown("<h4 style='color:#0f172a;text-align:center;'>PRE-OPERATION count auto</h4>")
+                    tbl_p3_before = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], elem_id="tbl_before")
+                with gr.Column(elem_classes="card"):
+                    gr.Markdown("<h3 style='color:#0f172a;text-align:center;'>POST-OPERATION </h3>")
+                    in_p3_after = gr.Image(label="POST-OPERATION - Post intervention", type="numpy", height=360)
+                    out_p3_after = gr.Image(label="POST-OPERATION - Masks auto", type="numpy", height=360)
+                    gr.Markdown("<h4 style='color:#0f172a;text-align:center;'>POST-OPERATION count auto</h4>")
+                    tbl_p3_after = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], elem_id="tbl_before")
+            with gr.Row(elem_classes="card"):
+                txt_p3 = gr.Textbox(label="Input prompts to segment", value="glove, gauze, syringe, scalpel", placeholder="glove, gauze, syringe")
+                chk_p3 = gr.Checkbox(label="Use REAL API - unchecked = MOCK", value=False)
+            with gr.Row():
+                btn_p3 = gr.Button("Run - Automatic Comparison", variant="primary", elem_id="btn-run")
+                btn_export_p3 = gr.Button("Export to JSON", variant="secondary")
+                btn_llama = gr.Button("Generate WHO Clinical Report", variant="primary", elem_id="btn-llama")
             
-        btn_llama = gr.Button("Generate Llama Clinical Report)", variant="primary")
-        llama_report = gr.Textbox(label="Llama 4 Clinical Risk Report - WHO Checklist", lines=20, interactive=False)
-        
-        stat_p3 = gr.Textbox(label="Status PRE-OPERATION | POST-OPERATION", interactive=False)
-        rep_p3 = gr.Textbox(label="Automatic report - Traceability", lines=18, interactive=False)
+            stat_p3 = gr.Textbox(label="Status", elem_classes="status-box")
+            with gr.Row():
+                rep_p3 = gr.Textbox(label="Automatic report - Traceability", lines=20, elem_classes="trace-box")
+                llama_report = gr.Textbox(label="WHO Checklist - Muse Spark", lines=20, elem_classes="who-box")
 
-        btn_reset_all = gr.Button("Reset", variant="stop")
-        
-        btn_p3.click(fn=process_phase3_auto, inputs=[in_p3_before, in_p3_after, txt_p3, chk_p3], outputs=[out_p3_before, out_p3_after, stat_p3, tbl_p3_before, tbl_p3_after, rep_p3])
-        btn_export_p3.click(fn=export_phase3, inputs=[rep_p3], outputs=[rep_p3])
-        btn_p3.click(fn=process_phase3_auto, inputs=[in_p3_before, in_p3_after, txt_p3, chk_p3], outputs=[out_p3_before, out_p3_after, stat_p3, tbl_p3_before, tbl_p3_after, rep_p3])
-        btn_export_p3.click(fn=export_phase3, inputs=[rep_p3], outputs=[rep_p3])
-        btn_llama.click(fn=generate_llama_clinical_report, inputs=[], outputs=[llama_report])
-        btn_reset_all.click(fn=reset_all, inputs=[], outputs=[in_before, out_before, stat_before, tbl_before, in_after, out_after, stat_after, tbl_after, rep1, in_single, out_single, stat_single, tbl_single, out_p3_before, out_p3_after, stat_p3, tbl_p3_before, tbl_p3_after, rep_p3])
+            btn_reset_all = gr.Button("Reset All", variant="stop", size="sm")
+            btn_p3.click(fn=process_phase3_auto, inputs=[in_p3_before, in_p3_after, txt_p3, chk_p3], outputs=[out_p3_before, out_p3_after, stat_p3, tbl_p3_before, tbl_p3_after, rep_p3])
+            btn_export_p3.click(fn=export_phase3, inputs=[rep_p3], outputs=[rep_p3])
+            btn_llama.click(fn=generate_llama_clinical_report, inputs=[], outputs=[llama_report])
+            btn_reset_all.click(fn=reset_all, inputs=[], outputs=[in_before, out_before, stat_before, tbl_before, in_after, out_after, stat_after, tbl_after, rep1, in_single, out_single, stat_single, tbl_single, out_p3_before, out_p3_after, stat_p3, tbl_p3_before, tbl_p3_after, rep_p3])
 
-
-    with gr.Tab("Mode 4: Before/After with Exemplars"):
-        gr.Markdown("""
-        **Workflow:**
-        1. Unprocessed images: blue metal tray with blood, jumbled instruments (actual OR)
-        2. Enter roll call text: Babcock, DeBakey, Metzenbaum...
-        3. SAM Auto suggests shapes (it doesn't know what they are)
-        4. Muse Spark 1.3 compares each dirty crop with your clean 512x512 white-background exemplars in the `exemplars_clean/` folder
-        5. Result: It distinguishes between Kelly and Pean even though SAM fails due to identical shapes
-        """)
-        with gr.Row():
-            with gr.Column():
-                in_p4_before = gr.Image(label="Mode 4: PRE-OP", type="numpy", interactive=True)
-                out_p4_before = gr.Image(label="Mode 4: PRE - Masks via exemplars", type="numpy", interactive=False)
-                tbl_p4_before = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], label="Mode 4: PRE count via exemplar")
-            with gr.Column():
-                in_p4_after = gr.Image(label="Mode 4: POST-OP", type="numpy", interactive=True)
-                out_p4_after = gr.Image(label="Mode 4: POST - Masks via exemplars", type="numpy", interactive=False)
-                tbl_p4_after = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], label="Mode 4: POST count via exemplar")
-        with gr.Row():
-            txt_p4 = gr.Textbox(label="Counting", value="forceps, scissors, gauze, glove", placeholder="Babcock, DeBakey, Metzenbaum")
-            chk_p4 = gr.Checkbox(label="Use REAL API", value=False)
-        with gr.Row():
-            btn_p4 = gr.Button("Run", variant="primary")
-        stat_p4 = gr.Textbox(label="Status Mode 4", interactive=False)
-        rep_p4 = gr.Textbox(label="Traceability", lines=12, interactive=False)
-        llama_p4 = gr.Textbox(label="Clinical Report", lines=20, interactive=False)
-        btn_p4.click(fn=process_phase4_before_after, inputs=[in_p4_before, in_p4_after, txt_p4, chk_p4], outputs=[out_p4_before, out_p4_after, stat_p4, tbl_p4_before, tbl_p4_after, rep_p4, llama_p4])
+        with gr.Tab("Mode 4: Before/After with Exemplars"):
+            gr.Markdown("""
+            **Workflow:**
+            1. Unprocessed images: blue metal tray with blood, jumbled instruments (actual OR)
+            2. Enter roll call text: Babcock, DeBakey, Metzenbaum...
+            3. SAM Auto suggests shapes (it doesn't know what they are)
+            4. Muse Spark 1.3 compares each dirty crop with your clean 512x512 white-background exemplars in the `exemplars_clean/` folder
+            5. Result: It distinguishes between Kelly and Pean even though SAM fails due to identical shapes
+            """)
+            with gr.Row():
+                with gr.Column(elem_classes="card"):
+                    gr.Markdown("<h3 style='color:#0f172a;text-align:center;'>PRE-OPERATION</h3>")
+                    in_p4_before = gr.Image(label="Mode 4: PRE-OP", type="numpy", height=360)
+                    out_p4_before = gr.Image(label="Mode 4: PRE - Masks via exemplars", type="numpy", height=360)
+                    gr.Markdown("<h4 style='color:#0f172a;text-align:center;'>PRE count via exemplar</h4>")
+                    tbl_p4_before = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], elem_id="tbl_before")
+                with gr.Column(elem_classes="card"):
+                    gr.Markdown("<h3 style='color:#0f172a;text-align:center;'>POST-OPERATION</h3>")
+                    in_p4_after = gr.Image(label="Mode 4: POST-OP", type="numpy", height=360)
+                    out_p4_after = gr.Image(label="Mode 4: POST - Masks via exemplars", type="numpy", height=360)
+                    gr.Markdown("<h4 style='color:#0f172a;text-align:center;'>POST count via exemplar</h4>")
+                    tbl_p4_after = gr.Dataframe(headers=["ID","Instrument","Points","Score","Source"], elem_id="tbl_before")
+            with gr.Row(elem_classes="card"):
+                txt_p4 = gr.Textbox(label="Counting", value="forceps, scissors, gauze, glove", placeholder="Babcock, DeBakey, Metzenbaum")
+                chk_p4 = gr.Checkbox(label="Use REAL API", value=True)
+            btn_p4 = gr.Button("Run", variant="primary", elem_id="btn-run")
+            stat_p4 = gr.Textbox(label="Status", elem_classes="status-box")
+            with gr.Row():
+                rep_p4 = gr.Textbox(label="Traceability", lines=20, elem_classes="trace-box")
+                llama_p4 = gr.Textbox(label="WHO Clinical Report", lines=20, elem_classes="who-box")
+            btn_p4.click(fn=process_phase4_before_after, inputs=[in_p4_before, in_p4_after, txt_p4, chk_p4], outputs=[out_p4_before, out_p4_after, stat_p4, tbl_p4_before, tbl_p4_after, rep_p4, llama_p4])
 
 if __name__ == "__main__":
-    demo.launch(share=False)
+    demo.launch(share=False, favicon_path=None, show_error=True)
