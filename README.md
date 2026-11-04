@@ -101,54 +101,105 @@ With REAL API:
 | Local vit_b alternative | $0, but 220s runtime |
 
 ## Getting Started
-### 1. Environment Setup
+We designed this repo to be reproducible even without Meta API keys or new surgical images. Just follow these instructions to replicate our results in <15 minutes.
+
+### 0. Requirements
+- **Python version used for this project: Python 3.11.9** (tested on Windows 11 Pro 26H2 + VSCode). Other Python versions were not tested.
+- 8GB RAM minimum. No GPU required, runs on CPU. For our tests we used a PC with the following specifications:
+  - AMD Ryzen 7 5700G CPU
+  - 32.0 GB RAM
+- Git installed.
+
+### 1. Clone and Environment Setup
 ```bash
+git clone https://github.com/MurilloLog/ZeroLeft.git
+cd ZeroLeft
+
+# Create virtual environment (recommended)
+python -m venv venv
+
+# Activate virtual environment (for windows):
+venv\Scripts\activate
+
+# (Or if you are using Linux/Mac):
+source venv/bin/activate
+
 pip install -r requirements.txt
 # torch, segment-anything, openai, meta-sam-parser, gradio, python-dotenv
+
+# Download the SAM free-weights
 curl -O https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
+# If you don't have curl, download manually and place in project root
 ```
 
-### 2. Environment Variables (```.env```)
+### 3. Test Images and Exemplars Already Included
+You don't need to provide new images to validate.
+
+- ```data/sample_images/``` folder has 6 real tray images (640x640 px) from OR we used for the demo.
+- ```exemplars_clean/``` folder has 10 clean exemplars on white background, 512x512, centered (Babcock, DeBakey, Metzenbaum, Mayo Scissors, etc.). Already included, you can run Mode 4 directly.
+
+If you want to test with your own images, just replace those folders. Keep 640x640 px for best results.
+
+### 3. Environment Variables (```.env```) - OPTIONAL
+**Important: You do NOT need an API key to run and validate the system.**
+
+The app has a built-in mock mode that simulates SAM 3.1 + Muse Spark responses without any external call. This is enabled by default if you uncheck the box ```Run in real mode```.
+
+If you want to use the real Meta APIs (recommended for full results):
+
+Create a ```.env``` file in root with the following variables:
+
 ```ini
-META_API_KEY=your_meta_api_key
+META_API_KEY=your_meta_api_key_from_dev.meta.ai
 META_API_BASE=https://api.meta.ai/v1
 SAM_TEXT_MODEL=sam-3.1
 LLAMA_MODEL=muse-spark-1.3-contributor
 ```
 
-### 3. Prepare Exemplars
-Create ```exemplars_clean/``` and add one clean image per instrument type on a white background, 512x512, centered.
+Each API call has a cost involved. We spent <$0.50 for 200+ calls. If you don't have a key, just skip this file.
 
-```text
-exemplars_clean/Babcock_tissue_forceps_clean.jpg
-exemplars_clean/DeBakey_forceps_clean.jpg
-exemplars_clean/Metzenbaum_scissors_clean.jpg
-...
-```
 ### 4. Launch the Application
 ```bash
 python app.py
-# Open http://127.0.0.1:7860
+# Open http://127.0.0.1:7860 in your browser
 ```
 
-#### Mode 4 workflow:
-1. Upload PRE and POST blue tray images.
-2. Enter a text prompt listing the items in the image: ```e.g., forceps, scissors, gauze, glove, metzenbaum```
-3. Check **REAL API box**
-4. Click **Run**
+### 5. How to Run Mode 4 (Final Agentic Pipeline)
+1. Upload PRE image: Use ```data/sample_images/pre-op_test1.jpg``` (or your own test image).
+2. Upload POST image: Use ```data/sample_images/post-op_test1.jpg```.
+3. In text prompt box, write generic terms that SAM 3.1 understands: forceps, scissors, gauze, gloves - Do NOT use fine-grained names like Babcock, we documented that returns 0 boxes.
+4. **REAL API checkbox**:
+- **UNCHECKED (default, no key needed)**: Runs in MOCK mode. Simulates SAM proposals and Muse Spark classification. Perfect to validate that the app launches, the pipeline works, and JSON exports are generated. Use this if you are a judge without API key.
+- **CHECKED (requires .env)**: Calls real Meta SAM 3.1 and Muse Spark 1.3 APIs. Batched, ∼15s, $0.025 per run.
+5. Click **Run Comparison**.
 
-#### Generated outputs:
-- ```exports/*.json``` - structured audit trail
-- ```exports/who_clinical_*.txt``` - WHO Safe Surgery report
+### 6. Generated Outputs (Auto-created)
+Even in mock mode, these files are created to prove replication:
+
+- ```exports/inventory_PRE_POST_*.json``` - structured audit trail with bboxes
+- ```exports/evaluacion_quiebre_*.json``` - our 5 documented breaking points
+- ```exports/who_clinical_*.txt``` - WHO Safe Surgery checklist + clinical report
+
+All exports are timestamped.
+
+### Common Issues for Beginners
+- **sam_vit_b_01ec64.pth** not found: Make sure the .pth is in the root folder, not in a subfolder.
+- **Port 7860 already in use**: Run python app.py --server-port 7861
+- **No module named 'segment_anything'**: Did you activate venv? Run ```pip install -r requirements.txt``` again.
+- **API returns 0 masks**: This is expected for fine-grained terms. Use generic terms: forceps instead of DeBakey. This is part of our documented breaking points, not a bug.
 
 ## Repository Structure
 ```
 ZeroLeft/
-├── app.py                          # Gradio UI Mode 1-4
-├── sam_client.py                   # SAM local + SAM 3.1 API backend
-├── exemplars_clean/                # Your manual exemplars
+├── app.py                          # Gradio UI Mode 1-4 (main entry)
+├── sam_client.py                   # SAM local + SAM 3.1 API + Mock backend
+├── requirements.txt                # Pinned versions for Python 3.11.9
+├── .env                            # Template for API keys (optional)
+├── exemplars_clean/                # 10 clean exemplars INCLUDED (512x512 white bg)
+├── data/
+│   └── sample_images/              # 6 test images INCLUDED
 ├── exports/                        # Auto-generated audit logs
-├── sam_vit_b_01ec64.pth            # SAM vit_b checkpoint
+├── sam_vit_b_01ec64.pth            # SAM vit_b checkpoint (367MB, download)
 └── README.md
 ```
 
@@ -195,7 +246,10 @@ Developed for the **Meta Global AI Developer Hackathon 2026** (Indie Developer T
 
 **Gustavo Adolfo Murillo** | [LinkedIn](https://www.linkedin.com/in/murillolog/)
 
-Watch the Full Video on [YouTube](https://youtu.be/ze_SFyxsAlk)
+## Demo Video
+[![ZeroLeft Demo](https://img.youtube.com/vi/ze_SFyxsAlk/0.jpg)](https://youtu.be/ze_SFyxsAlk)
+
+**Full demo:** https://youtu.be/ze_SFyxsAlk
 
 ## Acknowledgments
 - Meta AI for SAM 3.1 and Muse Spark API access.
